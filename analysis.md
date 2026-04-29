@@ -2267,3 +2267,275 @@ feat_mean_diff = (da_latent.mean() - teacher_latent.mean()).abs()
 | Flux 2 Klein 编辑能力适配 | 冻结编辑逻辑，只训练新 token 接口 | 保留 Flux 内置的语义编辑能力 |
 
 **整个系统的精髓**：DA-VAE 把"空间信息"重排到"通道维度"（无损），让 Flux 2 Klein 在同等计算预算下处理 4× 分辨率的图像，再用 Alignment Loss 保证新的 token 空间对原始模型是"可读的"。
+
+---
+
+## 十、完整训练顺序与输入输出详解
+
+> 这一节回答：训练怎么分阶段？新 VAE 的输入输出是什么？DiT 的输入输出是什么？"Base Noise"和"Detail Noise"究竟指什么？
+
+---
+
+### 10.0 全局视角：两阶段互不干扰
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Stage 1  ──────  DA-VAE 训练                                   │
+│                                                                  │
+│  目标: 训练出能压缩高清图像的新 Tokenizer (dc_down + dc_up)       │
+│  Transformer: 完全不参与，不动                                    │
+│  时长: ~5 H100-days                                              │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │  Stage 1 结束，保存 dc_down + dc_up 权重
+                           ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  Stage 2  ──────  DiT（Transformer）微调                        │
+│                                                                  │
+│  目标: 让 Transformer 学会处理 32 通道的新压缩潜码              │
+│  DA-VAE: 完全冻结，只用来编码训练图像                            │
+│  时长: ~3 H100-days（LoRA 模式）                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 10.1 Stage 1：DA-VAE 训练
+
+#### 10.1.1 谁被训练，谁被冻结
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  冻结（requires_grad = False）                                │
+│    ✦ 原始 VAE 的全部参数                                      │
+│      - encoder.conv_in, down_blocks, mid_block               │
+│      - encoder.conv_norm_out, conv_act                       │
+│      - decoder.mid_block, up_blocks, conv_norm_out, conv_out │
+│                                                              │
+│  可训练（requires_grad = True）                               │
+│    ✦ DCDownBlock2d (dc_down)  ← 新增，约 300K 参数            │
+│    ✦ DCUpBlock2d   (dc_up)   ← 新增，约 300K 参数            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 10.1.2 前向流程（以 SD3/1024 分辨率，da_factor=2 为例）
+
+```
+输入: 高清图像 [B, 3, 1024, 1024]
+      │
+      ├── 编码路径（训练）
+      │     ↓  _encode_preconv（冻结 VAE encoder，停在 conv_norm_out/conv_act）
+      │     [B, 512, 128, 128]   ← encoder 内部特征，不是最终潜码
+      │     ↓  dc_down（可训练 DCDownBlock2d）
+      │         主路径: Conv(512→256, s=1) → pixel_unshuffle(r=2) → [B, 256, 64, 64]
+      │         快捷路径: pixel_unshuffle(r=2) → grouped_mean → [B, 256, 64, 64]  （零参数）
+      │         主路径 + 快捷路径相加 → [B, 256, 64, 64]
+      │         注意: 256 = 2 × embed_dim_dc × 2 = 2 × 32 = 64... 
+      │
+      │  重新确认维度: embed_dim_dc = latent_channels × da_factor = 16 × 2 = 32
+      │               dc_down_out_channels = 2 × embed_dim_dc = 64
+      │               dc_down 实际输出: [B, 64, 64, 64]
+      │
+      │     ↓  DiagonalGaussianDistribution(h)
+      │         h[:, :32] = μ，h[:, 32:] = logσ²
+      │         z = μ + ε·σ  （reparameterization trick）
+      │
+      z_combined [B, 32, 64, 64]   ← 新的 32 通道压缩潜码
+      │
+      │  语义解释:
+      │     前 16 通道 = "Base Latent" z_b    → 被 Alignment Loss 强制对齐到原始 VAE 分布
+      │     后 16 通道 = "Detail Latent" z_d  → 额外编码的高频细节，无直接对应
+      │     （注意: dc_down 不强制分开输出，这是训练目标隐式施加的）
+      │
+      ↓  dc_up（可训练 DCUpBlock2d）
+      [B, 512, 128, 128]
+      ↓  _decode_from_preconv（冻结 VAE decoder，从 mid_block 开始）
+      重建图像 [B, 3, 1024, 1024]
+
+同时，Alignment Loss 需要一个 Teacher 路径:
+      低分辨率图像 [B, 3, 512, 512]（原图下采样 2×）
+      ↓  冻结完整 VAE.encode（原始标准编码）
+      z_teacher [B, 16, 64, 64]   ← 原始 VAE 的标准 16 通道潜码
+      （和 z_combined 的空间尺寸相同，通道数是一半）
+```
+
+#### 10.1.3 Stage 1 的损失函数
+
+```
+L_total = L_recon + L_lpips + L_kl + L_align
+
+L_recon = L1(重建图像, 原始图像) × 2.0
+L_lpips = LPIPS(重建图像, 原始图像) × 1.0
+L_kl    = KL(q(z|x) || N(0,I)) × 1e-7
+L_align = Alignment Loss（见 Section 三）
+          ↑
+          强制 z_combined（student）的自相似性矩阵
+          ≈ z_teacher 的自相似性矩阵
+          → 让新 z 的"结构语言"接近原始 VAE 的潜码空间
+```
+
+**Alignment Loss 的战略意义**：Stage 1 不只是重建质量，更是在为 Stage 2 铺路。通过 Alignment Loss，z_combined 的分布被"锚定"到原始 VAE 的分布附近。这样，到了 Stage 2 用原始 Transformer 权重初始化时，Transformer 看到的 z_b（前 16 通道）和它训练时见过的分布很接近，可以快速收敛。
+
+---
+
+### 10.2 Stage 2：DiT / Transformer 微调训练
+
+#### 10.2.1 谁被训练，谁被冻结
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  冻结（requires_grad = False）                                │
+│    ✦ DA-VAE 全部参数（dc_down + dc_up + 原始 VAE）            │
+│    ✦ Transformer 主体的预训练权重（Double/Single Stream）     │
+│    ✦ 文本编码器（CLIP + T5）                                  │
+│                                                              │
+│  可训练（requires_grad = True）                               │
+│    ✦ SplitAddConv2d 中的 extra_conv（零初始化，处理 detail 通道）│
+│    ✦ ConcatLinearHead（预测头，分开预测 base/detail）          │
+│    ✦ LoRA 层（注入 Transformer 的 Attention 和 FFN）          │
+│    ✦ 位置编码扩展（如需适配新 token 数量）                     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 10.2.2 Stage 2 的前向流程
+
+```
+─────────────── 数据准备（无梯度区域）───────────────
+
+高清图像 [B, 3, 1024, 1024]
+↓  冻结的 DA-VAE.encode()
+z_combined [B, 32, 64, 64]   ← 32 通道干净潜码
+  ├── z_b = z_combined[:, :16]   （Base Latent）
+  └── z_d = z_combined[:, 16:]   （Detail Latent）
+
+─────────────── 加噪（flow matching）────────────────
+
+# trainer.py 第 855-856 行
+noise = torch.randn_like(z_combined)           # [B, 32, 64, 64]
+noisy_z = (1 - σ) * z_combined + σ * noise    # [B, 32, 64, 64]
+
+关键: noise 是一个 32 通道的完整张量，不分 base/detail 分开生成。
+所谓 "base noise" = noise[:, :16]，"detail noise" = noise[:, 16:]，
+只是为了 Fig 9 那种可视化而事后分开统计，训练本身只有一个噪声。
+
+─────────────── Transformer 前向（有梯度区域）────────
+
+noisy_z [B, 32, 64, 64]
+↓  SplitAddConv2d（patch embedder 前端）
+     noisy_z[:, :16] → 预训练 base_conv（冻结 / LoRA）   → [B, 16, 64, 64]
+     noisy_z[:, 16:] → 零初始化 extra_conv（可训练）     → [B, 16, 64, 64]
+     两路相加 → [B, 32, 64, 64]
+↓  标准 patchify（每个 patch p×p 个像素）
+   [B, 32, 64, 64] → [B, 1024, 32·p²]
+↓  线性投影到 Transformer 维度 D
+   [B, 1024, D]   ← 1024 = 32×32 个空间 token
+↓  Transformer blocks（Double Stream + Single Stream）
+   与文本条件交叉注意力
+↓  ConcatLinearHead
+     → y_base   [B, 1024, 16·p²]
+     → y_detail [B, 1024, 16·p²]
+     → concat → [B, 1024, 32·p²]
+↓  标准 unpatchify
+   predicted_v [B, 32, 64, 64]
+
+─────────────── 损失计算 ─────────────────────────────
+
+target = z_combined（precondition 模式，预测干净潜码）
+loss   = MSE(predicted_v, target)  over all 32 channels
+
+# Fig 9 的双曲线是怎么来的：
+base_loss   = MSE(predicted_v[:, :16], target[:, :16])   # 蓝色曲线
+detail_loss = MSE(predicted_v[:, 16:], target[:, 16:])   # 绿色曲线
+total_loss  = (base_loss + detail_loss) / 2  ≈ loss
+
+训练初期:
+  - base_loss   很低（Transformer 认识 z_b 的分布，快速收敛）
+  - detail_loss 很高（extra_conv 从 0 开始，需要慢慢学）
+
+有 Alignment Loss（Stage 1 训好）:
+  - z_d 的统计结构 ≈ z_b 的结构 → detail_loss 能收敛
+  - Fig 9 绿色曲线最终和蓝色曲线都收敛到低点
+
+没有 Alignment Loss:
+  - z_d 对 Transformer 来说是完全陌生的分布
+  - detail_loss 很难收敛，或需要更多的步数
+```
+
+---
+
+### 10.3 为什么看起来像"两张图输入 Transformer"
+
+训练图里"Base Latent"和"Detail Latent"分开画，容易误以为送了两张图。实际上：
+
+```
+这是同一个编码过程的两个部分，不是两张独立图像：
+
+高清图像 → DA-VAE encode → z_combined [B, 32, h, w]
+                                ├── Base Latent (前 16 通道)
+                                └── Detail Latent (后 16 通道)
+                                      ↓
+                           这两部分 concat 在一起，作为一个
+                           32 通道张量传入 Transformer
+
+                           Transformer 只接受一个输入 tensor，
+                           并不知道（也不需要知道）32 个通道里
+                           哪 16 个是 base，哪 16 个是 detail。
+```
+
+论文的训练图把它们分开画，是为了强调：
+1. base 通道通过预训练的 base_conv 注入（利用旧权重）
+2. detail 通道通过新初始化的 extra_conv 注入（从零学习）
+3. loss 被分成两部分独立监控（Fig 9 双曲线）
+
+---
+
+### 10.4 推理阶段：无需区分 base/detail
+
+```
+初始状态: z_T [B, 32, 64, 64] ~ N(0, I)   ← 纯高斯噪声，32 个通道一起随机
+
+循环去噪（20~30 步，flow matching ODE）:
+  for t from T to 0:
+      noisy_z_t [B, 32, 64, 64]
+      ↓ Transformer（包含 LoRA 和新 patch embedder）
+      predicted_v [B, 32, 64, 64]
+      ↓ ODE solver 步进
+      noisy_z_{t-1}
+
+去噪完毕: z_0 [B, 32, 64, 64]   ← 干净的 32 通道压缩潜码
+
+解码:
+  z_0
+  ↓  dc_up（DCUpBlock2d）
+  [B, 512, 128, 128]
+  ↓  _decode_from_preconv（冻结 VAE decoder）
+  [B, 3, 1024, 1024]   ← 最终图像
+
+推理时完全不区分 base/detail。
+Base 通道和 Detail 通道只是同一个潜码空间里的两组通道，
+共同决定最终图像的质量。
+```
+
+---
+
+### 10.5 完整数据流对照表
+
+| 阶段 | 输入 | 可训练部分 | 输出 |
+|------|------|-----------|------|
+| Stage 1 编码 | 图像 [B,3,H,W] | dc_down | z [B,32,h,w] |
+| Stage 1 解码 | z [B,32,h,w] | dc_up | 重建图像 [B,3,H,W] |
+| Stage 1 对齐 | 低分辨率图像 | — | z_teacher [B,16,h,w]（用于 loss） |
+| Stage 2 编码 | 图像 [B,3,H,W] | 无（DA-VAE 冻结） | z [B,32,h,w] |
+| Stage 2 加噪 | z [B,32,h,w] | — | noisy_z [B,32,h,w]（32 通道整体加噪） |
+| Stage 2 预测 | noisy_z + 文本 | extra_conv, LoRA, head | predicted_v [B,32,h,w] |
+| 推理去噪 | noise [B,32,h,w] + 文本 | — | z_0 [B,32,h,w] |
+| 推理解码 | z_0 [B,32,h,w] | — | 图像 [B,3,H,W] |
+
+---
+
+### 10.6 结论速查
+
+- **Base Latent（z_b）**：z 的前 16 通道，被 Alignment Loss 对齐到原始 VAE 分布，Transformer 对它最熟悉
+- **Detail Latent（z_d）**：z 的后 16 通道，额外捕获高频细节，通过 extra_conv 从零学习
+- **Base Noise / Detail Noise**：同一个 32 通道噪声张量的两半，在 Fig 9 分开统计仅供诊断
+- **Stage 1 必须先于 Stage 2**：Stage 1 的 Alignment Loss 决定了 Stage 2 的收敛速度——如果 z_d 的分布和 z_b 差异太大，Transformer 微调就会很难收敛
+- **推理时 32 通道是统一的**：没有 base/detail 之分，Transformer 统一去噪，DA-VAE 统一解码
