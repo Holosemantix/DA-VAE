@@ -124,6 +124,138 @@ Teaser 传递的核心信息：**同样的图像质量，推理速度快 4 倍**
 
 ---
 
+### 0.3-DETAIL：Base Latent / Detail Latent 到底是什么？为什么图里看起来像两张图？
+
+> 这是最容易误解的地方，单独拆解。
+
+**最简单的一句话：不是两张图，是同一张图走了两条路。**
+
+```
+                    同一张高分辨率图像
+                    [B, 3, H, W]
+                         │
+             ┌───────────┴───────────┐
+             │                       │
+             ▼                       ▼
+    🔒 冻结的预训练              🔥 可训练的
+      VAE Encoder               Detail Encoder
+             │                       │
+             ▼                       ▼
+        z（Base Latent）         z_d（Detail Latent）
+        [B, C, h, w]              [B, D, h, w]
+        C=16 通道                  D=16 通道
+        "粗结构，模型已懂"          "高频细节，模型新学"
+             │                       │
+             └───────────┬───────────┘
+                         │ 沿通道维度拼接（channel-wise concat）
+                         ▼
+                   [z, z_d] 合并潜码
+                   [B, C+D, h, w]
+                   = [B, 32, h, w]（当 C=D=16 时）
+                         │
+                         ▼ 这才是送进 Transformer 的东西
+                   Transformer 接收的是一个潜码
+                   不是两张图，而是一个 32 通道的张量
+```
+
+**为什么图里显示两条路？**
+
+因为 C+D 个通道里的信息来自两个不同的"信息源"：
+- 前 C 通道（Base）：由不动的预训练 VAE 产生，就像原版模型见过的样子
+- 后 D 通道（Detail）：由新加的 Detail Encoder 产生，补充高频细节
+
+同一张图，两个 Encoder，两组通道，拼在一起。
+
+---
+
+**Transformer 怎么处理这 C+D 通道？**
+
+代码用了 `SplitAddConv2d`（`sd3_transformer_wrapper_tokenizer.py:38`）：
+
+```
+输入 z_combined: [B, C+D, h, w]  = [B, 32, 64, 64]（以 da_factor=2 为例）
+                         │
+          ┌──────────────┴──────────────┐
+          │  按通道切分                   │
+          ▼                             ▼
+  x_base = z[:, :C, :, :]      x_extra = z[:, C:, :, :]
+  [B, 16, 64, 64]               [B, 16, 64, 64]
+  （Base Latent）                （Detail Latent）
+          │                             │
+          ▼                             ▼
+  base_conv（预训练权重）        extra_conv（🟡 零初始化）
+  Conv2d(16→D_model)            Conv2d(16→D_model)
+          │                             │
+          └──────────── + ──────────────┘
+                        │  element-wise 相加
+                        ▼
+              token embedding [B, N, D_model]
+              ← 这才是 Transformer 的真正输入
+```
+
+**零初始化的关键作用**：
+
+```
+训练第 0 步:
+  extra_conv 权重全为 0
+  → extra_conv(x_extra) = 0（对任何输入都输出 0）
+  → token = base_conv(x_base) + 0 = base_conv(x_base)
+  → 完全等价于原始预训练 Transformer，什么都没变！
+
+训练过程中:
+  extra_conv 权重从 0 开始慢慢更新
+  → token 逐渐 = base 信息 + detail 信息
+  → 模型在已有能力的基础上学习利用 Detail Latent
+
+训练完成后:
+  extra_conv 已充分训练
+  → 模型能同时理解 Base 和 Detail 两部分信息
+  → 生成质量超越只有 C 通道的原版模型
+```
+
+---
+
+**Base 和 Detail 的直觉理解（以 1024×1024 图像为例）**：
+
+```
+标准 VAE（只有 Base）:
+  1024×1024 图像 → 压缩到 [16, 128, 128]
+  每个 token 覆盖原图 8×8 像素区域
+  信息密度：1 token 代表 64 个像素
+
+DA-VAE（Base + Detail，da_factor=2）:
+  同一 1024×1024 图像 → [16, 64, 64] Base + [16, 64, 64] Detail
+  空间 token 数减半（64×64 而不是 128×128）
+  但每个 token 现在有 32 个通道（而不是 16）
+  每个 token 覆盖原图 16×16 像素区域，但用 32 通道来编码这 256 个像素的信息
+
+  Base 通道（16个）：编码这 16×16 区域的"主体语义"（颜色、物体类别、粗糙轮廓）
+  Detail 通道（16个）：编码这 16×16 区域的"细粒度纹理"（边缘、高频纹路、细节）
+
+  合起来：用 32 通道描述 256 像素，信息密度提升
+         但空间位置数从 128×128 降到 64×64，token 总数从 4096 → 1024
+```
+
+**Output Head 也是对称的双分支：**
+
+Transformer 最后输出 token embedding，解码回 z 时也需要预测 C+D 通道：
+
+```
+token embedding [B, N, D_model]
+         │
+         ├─ base_linear（预训练权重）→ [B, N, p²×C] → z_b 部分
+         └─ extra_linear（零初始化）→ [B, N, p²×D] → z_d 部分
+                         │
+                    沿 patch 内通道维度 concat
+                         ▼
+                    [z_b, z_d] 预测结果
+                    [B, C+D, h, w]
+```
+
+代码中的 `ConcatLinearHead`（`sd3_transformer_wrapper_tokenizer.py:76`）实现了这一点。
+
+---
+
 ### 0.4 Fig 3：SD3-VAE 架构实例化图
 
 **原文 caption**：DA-VAE instantiated on SD3-VAE with lightweight downsampling and upsampling blocks.
