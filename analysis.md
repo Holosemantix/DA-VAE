@@ -2575,6 +2575,42 @@ majie_16x64ch(pretrained=None)
 
 ---
 
+### 11.0B DA-VAE 的 full mode vs detail/diff mode
+
+两种模式最大的区别不是空间压缩倍数，而是 **DA-VAE 输出的 latent 是"完整替代旧 VAE latent"，还是"只学习新增 detail/diff latent，再和旧 VAE base latent 拼接"**。
+
+以 SD3 VAE `latent_channels=16, da_factor=2` 为例：
+
+| 模式 | DA encoder 直接输出 | 是否额外取原 VAE/base latent | 送入 decoder / DiT 的总 latent | 语义 |
+|------|---------------------|------------------------------|-------------------------------|------|
+| **full** | `z_full [B,32,H/16,W/16]` | 不需要 | `[B,32,H/16,W/16]` | 32 通道整体都是 DA-VAE 学出来的新 latent |
+| **diff / detail** | `z_detail [B,16,H/16,W/16]` | 需要 `z_base [B,16,H/16,W/16]` | `concat([z_base,z_detail])` 或代码里 `concat([z_detail,z_base])`，总共 32 通道 | 16 通道保留旧 VAE/base 分布，16 通道学习新增细节 |
+
+代码对应关系：
+
+```python
+# full mode
+embed_dim_dc = latent_channels * da_factor      # 16 * 2 = 32
+dc_down 输出 2 * embed_dim_dc = 64 moments
+posterior.sample() 得到 z_full: 32 通道
+decode(z_full)
+
+# diff/detail mode
+embed_dim_dc = latent_channels * (da_factor-1)  # 16 * 1 = 16
+dc_down 输出 2 * embed_dim_dc = 32 moments
+posterior.sample() 得到 z_detail: 16 通道
+再拼接 teacher/base latent z_base: 16 通道
+decode(concat([z_detail, z_base]))  # 总输入仍是 32 通道
+```
+
+所以：
+
+- **full mode** 更像"训练一个新的 16× VAE latent space"，它输出 32 通道完整 latent，和原 16 通道 VAE 的结构关系弱一些。
+- **detail/diff mode** 更接近论文里的 base+detail 结构：保留原 VAE 的 16 通道作为 base anchor，只让新增路径学习 16 个 detail/diff 通道。
+- 进入 DiT 时两者的总通道数都可以是 32，但 full mode 的 32 通道没有显式 base/detail 切分；diff/detail mode 有明确的 base/detail 切分，因此更适合 zero-init branch patch embed 和迁移预训练 DiT。
+
+---
+
 ### 11.0A 训练后的 16× Encoder 通道数是否和之前 Encoder 一致？
 
 先区分两个容易混在一起的"通道数"：
@@ -2769,7 +2805,7 @@ DA-VAE DCUpBlock2d 快捷路径:
 | **训练约束** | Stage 1 Alignment Loss 是关键 | 无 alignment 约束 |
 | **潜码统计** | 依赖 SD3 VAE 的归一化（shift/scale） | z_mean=-0.0245, z_std=0.761（独立统计）|
 | **Encoder 可冻结** | 冻结原始 VAE encoder 是设计目标 | 支持 freeze_enc 配置 |
-| **2K 支持** | da_factor=4 可扩展到 2K（token 不增加） | 16× 固定；2K → 128×128=16K 空间位置 |
+| **2K 支持** | da_factor=4 可扩展到 2K（DiT token 可保持 1024，patch_size=2） | 16× 固定；2K → 128×128 latent grid，patch_size=2 后是 4096 DiT tokens |
 
 ---
 
@@ -2801,20 +2837,29 @@ DA-VAE 16×:  [B, 3, 1024,1024] → 原 VAE 8×瓶颈 [B,512,128,128]
 
 ---
 
-### 11.5 分辨率 → 潜码维度对照
+### 11.5 分辨率 → latent grid 与 DiT token 对照
 
-| 输入分辨率 | DA-VAE (da_factor=2) | DA-VAE (da_factor=4) | 新 VAE (16×) |
-|-----------|---------------------|---------------------|-------------|
-| 256×256   | [B, 32, 16, 16] = 256 token | [B, 64, 8, 8] = 64 token | [B, 64, 16, 16] = 256 token |
-| 512×512   | [B, 32, 32, 32] = 1024 token | [B, 64, 16, 16] = 256 token | [B, 64, 32, 32] = 1024 token |
-| 1024×1024 | [B, 32, 64, 64] = 4096 token | [B, 64, 32, 32] = 1024 token | [B, 64, 64, 64] = 4096 token |
-| 2048×2048 | [B, 32, 128, 128] = 16384 token | [B, 64, 64, 64] = 4096 token | [B, 64, 128, 128] = 16384 token |
+注意这里必须区分两个数量：
+
+```
+latent grid cells = H_latent × W_latent
+DiT sequence tokens = (H_latent / patch_size) × (W_latent / patch_size)
+```
+
+SD3/Flux 这类 DiT 通常 `patch_size=2`，所以 DiT token 数还要再除以 4。
+
+| 输入分辨率 | DA-VAE (da_factor=2) latent / DiT tokens | DA-VAE (da_factor=4) latent / DiT tokens | 新 VAE (16×) latent / DiT tokens |
+|-----------|------------------------------------------|------------------------------------------|----------------------------------|
+| 256×256   | [B,32,16,16] = 256 cells / 64 tokens | [B,64,8,8] = 64 cells / 16 tokens | [B,64,16,16] = 256 cells / 64 tokens |
+| 512×512   | [B,32,32,32] = 1024 cells / 256 tokens | [B,64,16,16] = 256 cells / 64 tokens | [B,64,32,32] = 1024 cells / 256 tokens |
+| 1024×1024 | [B,32,64,64] = 4096 cells / 1024 tokens | [B,64,32,32] = 1024 cells / 256 tokens | [B,64,64,64] = 4096 cells / 1024 tokens |
+| 2048×2048 | [B,32,128,128] = 16384 cells / 4096 tokens | [B,64,64,64] = 4096 cells / 1024 tokens | [B,64,128,128] = 16384 cells / 4096 tokens |
 
 关键发现：
 
-- DA-VAE (da_factor=2) 和新 VAE 在相同分辨率下生成**相同数量的空间位置**（token 数），但新 VAE 通道数多一倍（64 vs 32）
-- DA-VAE (da_factor=4) 能把 2K 图像压到和 1K 标准推理一样的 4096 tokens；新 VAE 做不到这点（16× 固定，无法按需扩展压缩比）
-- 若用新 VAE 做 2K 编辑，Transformer 需要处理 **16384 个 token**，是 1K 标准规模的 4 倍，推理成本高出 16 倍（注意力是二次方）
+- DA-VAE (da_factor=2) 和新 VAE (16×) 在相同分辨率、相同 `patch_size=2` 下有**相同 DiT sequence token 数**；差别是新 VAE 每个 latent cell 有 64 通道，DA-VAE 是 32 通道。
+- 1024×1024 时，两者进入 DiT 都是 **1024 sequence tokens**，不是 4096；4096 是 latent grid cells。
+- 2048×2048 时，新 VAE 16× 进入 DiT 是 **4096 sequence tokens**；DA-VAE (da_factor=4) 是 **1024 sequence tokens**。所以新 VAE 2K 的注意力开销相对 DA-VAE f32 仍是 4² = 16 倍，但不是 16384 tokens。
 
 ---
 
@@ -2851,7 +2896,7 @@ DCDown **同时** 做空间压缩和通道压缩，是真正的"双重压缩"。
 ```
 方案 A：DA-VAE (da_factor=4) 挂载在 Flux 2 Klein 上
   优势:
-    ✓ 2K 输入 → 4096 token（与 1K 标准 Flux 相同规模）
+    ✓ 2K 输入 → 4096 latent cells；patch_size=2 后是 1024 DiT tokens
     ✓ 可复用 Flux 预训练权重（Alignment Loss + Zero-init）
     ✓ 新增参数极少（~600K DC blocks）
     ✓ da_factor 可调，弹性扩展压缩比
@@ -2864,12 +2909,13 @@ DCDown **同时** 做空间压缩和通道压缩，是真正的"双重压缩"。
     ✓ 架构更干净，无依赖
     ✓ 64 通道提供更大的信息容量
     ✓ 下采样分布更均匀，每级感受野递增（UNet 风格）
+    ✓ 1K 输入时和 DA-VAE 16× 一样，patch_size=2 后都是 1024 DiT tokens
     ✓ 无需 Alignment Loss（无 pretrained Transformer 兼容问题）
   劣势:
-    ✗ 2K 输入 → 16384 token（注意力成本 ×16，不可接受）
+    ✗ 2K 输入 → 16384 latent cells；patch_size=2 后是 4096 DiT tokens
     ✗ 无法直接复用 Flux 2 Klein 权重
     ✗ 需要完整 DiT 训练（成本数量级更高）
-    ✗ 若要用于 2K，仍需叠加一层额外压缩（本质上又回到 DA-VAE 的路线）
+    ✗ 若目标是让 2K 也保持 1024 DiT tokens，仍需叠加一层额外压缩（本质上又回到 DA-VAE 的路线）
 
 方案 C：新 VAE 用于 1K 中间表示，再叠加 DA-VAE 压缩做 2K
   ┌──────────────────────────────────────────────────────┐
