@@ -2575,6 +2575,28 @@ majie_16x64ch(pretrained=None)
 
 ---
 
+### 11.0A 训练后的 16× Encoder 通道数是否和之前 Encoder 一致？
+
+先区分两个容易混在一起的"通道数"：
+
+1. **Encoder 主干最后的瓶颈特征通道**：进入 `conv_out` 或 DA-VAE `dc_down` 之前的高维 feature map。
+2. **最终 latent 通道**：VAE 真正输出给 DiT / Decoder 的 `z` 通道数。
+
+结论：
+
+| 对象 | 主干最后瓶颈特征 | Gaussian moments 输出 | 采样后的 latent `z` | 是否和旧 Encoder 一致 |
+|------|------------------|----------------------|---------------------|------------------------|
+| 原 SD3/Flux VAE（8×） | 512 通道 | 32 通道 = 16 μ + 16 logσ² | 16 通道 | 基准 |
+| DA-VAE（SD3, da_factor=2, full mode） | 512 通道（沿用原 VAE encoder） | 64 通道 = 32 μ + 32 logσ² | 32 通道 | 主干 512 一致；最终 latent 不一致 |
+| DA-VAE（SD3, da_factor=2, diff/detail mode） | 512 通道（沿用原 VAE encoder） | 32 通道 = 16 μ + 16 logσ² | 16 detail 通道；再和 16 base 通道 concat | detail latent 和旧 latent 同为 16；总输入为 32 |
+| 新 VAE（16×-64ch） | 512 通道 | 128 通道 = 64 μ + 64 logσ² | 64 通道 | 主干 512 一致；最终 latent 不一致 |
+
+所以，如果问的是 **训练好的 16× encoder 主干最后 feature channel**，答案是：**和之前 encoder 一致，仍然是 512 通道**。这点在 `new_vae.py` 里由 `ch=128, ch_mult=[1,2,4,4,4]` 决定，最后 `block_in = 128×4 = 512`；在 DA-VAE 里则直接读取原 SD3 VAE 的 `encoder.conv_norm_out.num_channels`，也是 512。
+
+但如果问的是 **encoder 最终输出 latent 的 channel 数**，答案是：**不一致**。旧 SD3/Flux VAE 是 16 通道；新 VAE 16× 是 64 通道；DA-VAE 的 16× 总 latent 通常是 32 通道（16 base + 16 detail），其中 diff/detail mode 下新增训练的 detail encoder 本身输出 16 通道，和旧 VAE 的 base latent 数量相同。
+
+---
+
 ### 11.1 编码器完整形状追踪（1024×1024 输入）
 
 ```
@@ -2748,6 +2770,34 @@ DA-VAE DCUpBlock2d 快捷路径:
 | **潜码统计** | 依赖 SD3 VAE 的归一化（shift/scale） | z_mean=-0.0245, z_std=0.761（独立统计）|
 | **Encoder 可冻结** | 冻结原始 VAE encoder 是设计目标 | 支持 freeze_enc 配置 |
 | **2K 支持** | da_factor=4 可扩展到 2K（token 不增加） | 16× 固定；2K → 128×128=16K 空间位置 |
+
+---
+
+### 11.4A 降采方法与最终输出通道的直接对比
+
+两者都能把 1024×1024 图像变成 64×64 latent grid，但达到这个结果的路径不同，最后给 DiT / Decoder 的通道数也不同。
+
+| 项目 | DA-VAE（SD3, da_factor=2） | 新 VAE（16×-64ch） |
+|------|----------------------------|--------------------|
+| 16× 空间降采来源 | 原 VAE 先做 8×；DA-VAE 只在瓶颈末端额外做一次 2× `dc_down` | Encoder 内部连续做 4 次 2× downsample |
+| 下采位置 | 集中在原 VAE encoder `conv_out` 之前 | 分散在 Level 0/1/2/3 四个阶段 |
+| 下采主路径 | `Conv(512→16 or 8, stride=1)` 后 `pixel_unshuffle(2)`，得到 moments 通道 | 前两次 `Downsample_shortcut_enlarge_ch` 扩通道，后两次 `Downsample_shortcut` 保持 512 |
+| 下采 shortcut | 对 512 通道瓶颈特征做 `pixel_unshuffle(2)`，再 grouped mean / 1×1 投影到目标 moments 通道 | 每个 downsample 都有 pixel_unshuffle + grouped mean shortcut |
+| 下采后 moments | full mode: 64 通道；diff/detail mode: 32 通道 | 128 通道 |
+| 采样后的 latent | full mode: 32 通道；diff/detail mode: 16 detail 通道 | 64 通道 |
+| DiT/Decoder 实际看到的 16× latent | 32 通道：16 base + 16 detail（diff/detail mode 是 concat 后得到） | 64 通道：无 base/detail 显式划分 |
+
+关键差异一句话：
+
+```
+DA-VAE 16×:  [B, 3, 1024,1024] → 原 VAE 8×瓶颈 [B,512,128,128]
+            → dc_down 额外 2× → total latent [B,32,64,64]
+
+新 VAE 16×: [B, 3, 1024,1024] → 4 次 2× 下采 → 瓶颈 [B,512,64,64]
+            → conv_out → latent [B,64,64,64]
+```
+
+因此，在相同 16× 空间压缩下：**DA-VAE 最终是 32 latent channels，新 VAE 最终是 64 latent channels**。新 VAE 的单 token 容量更大，但不再保留"前 16 通道兼容预训练 VAE / Transformer"的结构；DA-VAE 的通道更少，却保留了 16-channel base latent 作为迁移和对齐锚点。
 
 ---
 
