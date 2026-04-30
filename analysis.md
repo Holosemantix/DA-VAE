@@ -2539,3 +2539,312 @@ Base 通道和 Detail 通道只是同一个潜码空间里的两组通道，
 - **Base Noise / Detail Noise**：同一个 32 通道噪声张量的两半，在 Fig 9 分开统计仅供诊断
 - **Stage 1 必须先于 Stage 2**：Stage 1 的 Alignment Loss 决定了 Stage 2 的收敛速度——如果 z_d 的分布和 z_b 差异太大，Transformer 微调就会很难收敛
 - **推理时 32 通道是统一的**：没有 base/detail 之分，Transformer 统一去噪，DA-VAE 统一解码
+
+---
+
+## 十一、新 VAE（16x-64ch）与 DA-VAE 的架构对比
+
+> 代码来源：用户提供的 `AutoencoderKL`（以下称"新 VAE"，工厂函数 `majie_16x64ch`）
+> 对照目标：DA-VAE on SD3（da_factor=2）
+> 共同点：**都实现 16× 空间下采样**（1024×1024 输入 → 64×64 潜码）
+
+---
+
+### 11.0 新 VAE 核心参数一览
+
+```python
+majie_16x64ch(pretrained=None)
+  → config = {"z_channels": 64, "resolution": 256}
+  → AutoencoderKL(Encoder + Decoder)
+
+  Encoder:
+    ch = 128
+    ch_mult    = [1, 2, 4, 4, 4]     # 5 个 level 的通道倍数
+    num_res_blocks = [2, 3, 2, 2, 2]  # 每个 level 的 ResBlock 数量
+    downsampling: 4 次 2× = 16× 总计
+
+  Latent:
+    z_channels = 64   # 每个空间位置 64 个通道
+    z_mean = -0.0245  # 训练得到的经验均值（用于 DiT normalization）
+    z_std  =  0.7611  # 训练得到的经验标准差
+
+  Decoder:
+    symmetric to Encoder（逆向 5 个 level）
+    ch_mult = [1, 2, 4, 4, 4]（倒序遍历）
+```
+
+---
+
+### 11.1 编码器完整形状追踪（1024×1024 输入）
+
+```
+输入: [B, 3, 1024, 1024]
+  ↓  conv_in: Conv2d(3→128, k=3, s=1)
+  [B, 128, 1024, 1024]
+
+─── Level 0 (ch_mult=1, block_in=128→128, 2 ResBlocks) ───────────────
+  ResBlock×2: 128→128
+  [B, 128, 1024, 1024]
+  ↓  Downsample_shortcut_enlarge_ch(128, with_conv=True)
+     主路径: pad(0,1,0,1) → Conv(128→256, k=3, s=2)  → [B, 256, 512, 512]
+     快捷路径: pixel_unshuffle(r=2) → view(B,256,2,H,W).mean(dim=2) → [B, 256, 512, 512]
+     主 + 快捷 → [B, 256, 512, 512]   ← 空间 ÷2，通道 ×2
+
+─── Level 1 (ch_mult=2, block_in=256→256, 3 ResBlocks) ───────────────
+  [i_block=0 时 override block_in=256]  ← 接续上层 downsample 的输出通道
+  ResBlock×3: 256→256
+  [B, 256, 512, 512]
+  ↓  Downsample_shortcut_enlarge_ch(256, with_conv=True)
+     主路径: Conv(256→512, s=2) → [B, 512, 256, 256]
+     快捷路径: pixel_unshuffle(r=2) → grouped_mean(→256通道) ... wait:
+       in_channels=256, out_channels=512, factor=2
+       group_size = 256*4/512 = 2
+       pixel_unshuffle → [B, 1024, 256, 256] → view(B,512,2,H,W).mean → [B, 512, 256, 256]
+     主 + 快捷 → [B, 512, 256, 256]   ← 空间 ÷2，通道 ×2
+
+─── Level 2 (ch_mult=4, block_in=512→512, 2 ResBlocks) ───────────────
+  [i_block=0 时 override block_in=512]
+  ResBlock×2: 512→512
+  [B, 512, 256, 256]
+  ↓  Downsample_shortcut(512, with_conv=True)
+     主路径: Conv(512→512, s=2) → [B, 512, 128, 128]
+     快捷路径: pixel_unshuffle(r=2) → group_size=4 → grouped_mean → [B, 512, 128, 128]
+     主 + 快捷 → [B, 512, 128, 128]   ← 空间 ÷2，通道不变
+
+─── Level 3 (ch_mult=4, block_in=512→512, 2 ResBlocks) ───────────────
+  ResBlock×2: 512→512
+  [B, 512, 128, 128]
+  ↓  Downsample_shortcut(512)
+     同上 → [B, 512, 64, 64]   ← 空间 ÷2，通道不变
+
+─── Level 4 (ch_mult=4, block_in=512→512, 2 ResBlocks) ───────────────
+  ResBlock×2: 512→512
+  [B, 512, 64, 64]
+  (无 downsample，最后一个 level)
+
+─── Middle ────────────────────────────────────────────────────────────
+  ResBlock(512) + AttnBlock(512) + ResBlock(512)
+  [B, 512, 64, 64]
+
+─── End ───────────────────────────────────────────────────────────────
+  norm_out: GroupNorm(32, 512)
+  nonlinearity: SiLU
+  Encode_conv_out_shortcut(in_channels=512, z_channels=64):
+    主路径: Conv(512→128, k=3, s=1) → [B, 128, 64, 64]   (128 = 2×z_channels = μ+logσ²)
+    快捷路径: PixelUnshuffleChannelAveragingDownSampleLayer_convout(512→128, factor=1)
+      view(B, 128, 4, 64, 64).mean(dim=2) → [B, 128, 64, 64]   ← 纯通道平均，无空间变化
+    主 + 快捷 → [B, 128, 64, 64]
+
+  chunk(dim=1) → μ [B, 64, 64, 64], logσ² [B, 64, 64, 64]
+  z = μ + exp(0.5·logσ²) · ε
+
+输出: z [B, 64, 64, 64]   ← 16× 下采，64 通道
+```
+
+---
+
+### 11.2 解码器完整形状追踪
+
+```
+输入: z [B, 64, 64, 64]
+
+  Decode_conv_in_shortcut(in_channels=512, z_channels=64):
+    主路径: Conv(64→512, k=3, s=1) → [B, 512, 64, 64]
+    快捷路径: ChannelDuplicatingPixelUnshuffleUpSampleLayer_2d(64→512, factor=1)
+      repeats = 512*1²/64 = 8
+      repeat_interleave(8) → [B, 512, 64, 64]  → pixel_shuffle(1) 无操作 → [B, 512, 64, 64]
+    主 + 快捷 → [B, 512, 64, 64]
+
+  Middle: ResBlock + Attn + ResBlock → [B, 512, 64, 64]
+
+─── Upsample Level 4 (block_out=512, 3 ResBlocks) ────────────────────
+  ResBlock×3: 512→512
+  Upsample_shortcut(512):
+    主路径: F.interpolate(×2, nearest) → Conv(512→512) → [B, 512, 128, 128]
+    快捷路径: repeat_interleave(4) → pixel_shuffle(2) → [B, 512, 128, 128]
+    主 + 快捷 → [B, 512, 128, 128]
+
+─── Upsample Level 3 (block_out=512, 3 ResBlocks) ────────────────────
+  ResBlock×3: 512→512 → [B, 512, 128, 128]
+  Upsample_shortcut(512) → [B, 512, 256, 256]
+
+─── Upsample Level 2 (block_out=512, 3 ResBlocks) ────────────────────
+  ResBlock×3: 512→512 → [B, 512, 256, 256]
+  Upsample_shortcut(512) → [B, 512, 512, 512]
+
+─── Upsample Level 1 (block_out=256, 4 ResBlocks) ────────────────────
+  ResBlock[0]: 512→256  (通道减半)
+  ResBlock×3:  256→256
+  [B, 256, 512, 512]
+  Upsample_shortcut(256) → [B, 256, 1024, 1024]
+
+─── Upsample Level 0 (block_out=128, 3 ResBlocks, 无 upsample) ────────
+  ResBlock[0]: 256→128  (通道减半)
+  ResBlock×2:  128→128
+  [B, 128, 1024, 1024]
+
+  norm_out + SiLU → [B, 128, 1024, 1024]
+  conv_out: Conv(128→3, k=3, s=1) → [B, 3, 1024, 1024]
+
+输出: 重建图像 [B, 3, 1024, 1024]
+```
+
+---
+
+### 11.3 两者共用的核心原语：pixel_unshuffle 快捷路径
+
+这是最重要的共同点。两个 VAE 都把相同的"信息守恒下采样快捷路径"作为核心设计：
+
+```
+─── 下采样快捷路径（两者都有）───────────────────────────────────────
+
+DA-VAE DCDownBlock2d 快捷路径:
+  [B, 512, H, W] → pixel_unshuffle(r=2) → [B, 2048, H/2, W/2]
+                 → grouped_mean(group=32) → [B, 64, H/2, W/2]
+  零参数，信息无损重排 + 平均池化
+
+新 VAE Downsample_shortcut 快捷路径:
+  [B, 512, H, W] → pixel_unshuffle(r=2) → [B, 2048, H/2, W/2]
+                 → grouped_mean(group=4)  → [B, 512, H/2, W/2]
+  零参数，同样机制
+
+新 VAE Downsample_shortcut_enlarge_ch 快捷路径:
+  [B, 256, H, W] → pixel_unshuffle(r=2) → [B, 1024, H/2, W/2]
+                 → grouped_mean(group=2)  → [B, 512, H/2, W/2]
+  零参数，通道同时翻倍
+
+─── 上采样快捷路径（两者都有）───────────────────────────────────────
+
+DA-VAE DCUpBlock2d 快捷路径:
+  [B, 64, H, W] → repeat_interleave(r²=4) → [B, 256, H, W]
+               → pixel_shuffle(r=2)        → [B, 64, 2H, 2W]
+  零参数
+
+新 VAE Upsample_shortcut 快捷路径:
+  [B, C, H, W] → repeat_interleave(4) → [B, 4C, H, W]
+              → pixel_shuffle(2)      → [B, C, 2H, 2W]
+  零参数，同样机制
+```
+
+**结论**：两者在"如何做无损的分辨率变换"上使用完全相同的数学原语（pixel_unshuffle/shuffle + 通道平均/复制）。区别在于这个原语被放在架构的哪个位置以及如何组合。
+
+---
+
+### 11.4 关键架构差异对比
+
+| 维度 | DA-VAE（SD3, da_factor=2） | 新 VAE（majie_16x64ch） |
+|------|---------------------------|------------------------|
+| **架构类型** | 插件式（依赖预训练 VAE） | 独立从头训练 |
+| **16× 的实现方式** | 预训练 VAE 8× + DCDown 额外 2× | 4 个独立 2× 下采阶段串联 |
+| **新增可训练参数** | 约 600K（仅 dc_down + dc_up） | 完整 UNet 编解码，约 400M+ |
+| **潜码形状（1024²）** | [B, 32, 64, 64] | [B, 64, 64, 64] |
+| **潜码通道** | 32（16 base + 16 detail） | 64（无显式语义划分） |
+| **通道语义** | base/detail 分开（对齐约束） | 均匀 64 通道 |
+| **压缩放置位置** | 瓶颈层之后（编码器末端一步） | 分散于整个编码器的 4 个阶段 |
+| **通道演变策略** | 512→64（一步大幅压缩通道） | 128→256→512→512→512（渐进式） |
+| **conv_out 快捷路径** | DCDown 里的 pixel_unshuffle（含空间压缩） | factor=1（纯通道平均，无空间变化） |
+| **与预训练 DiT 的兼容性** | 通过 Alignment Loss 强制兼容 | 需从头训练配套 DiT |
+| **训练约束** | Stage 1 Alignment Loss 是关键 | 无 alignment 约束 |
+| **潜码统计** | 依赖 SD3 VAE 的归一化（shift/scale） | z_mean=-0.0245, z_std=0.761（独立统计）|
+| **Encoder 可冻结** | 冻结原始 VAE encoder 是设计目标 | 支持 freeze_enc 配置 |
+| **2K 支持** | da_factor=4 可扩展到 2K（token 不增加） | 16× 固定；2K → 128×128=16K 空间位置 |
+
+---
+
+### 11.5 分辨率 → 潜码维度对照
+
+| 输入分辨率 | DA-VAE (da_factor=2) | DA-VAE (da_factor=4) | 新 VAE (16×) |
+|-----------|---------------------|---------------------|-------------|
+| 256×256   | [B, 32, 16, 16] = 256 token | [B, 64, 8, 8] = 64 token | [B, 64, 16, 16] = 256 token |
+| 512×512   | [B, 32, 32, 32] = 1024 token | [B, 64, 16, 16] = 256 token | [B, 64, 32, 32] = 1024 token |
+| 1024×1024 | [B, 32, 64, 64] = 4096 token | [B, 64, 32, 32] = 1024 token | [B, 64, 64, 64] = 4096 token |
+| 2048×2048 | [B, 32, 128, 128] = 16384 token | [B, 64, 64, 64] = 4096 token | [B, 64, 128, 128] = 16384 token |
+
+关键发现：
+
+- DA-VAE (da_factor=2) 和新 VAE 在相同分辨率下生成**相同数量的空间位置**（token 数），但新 VAE 通道数多一倍（64 vs 32）
+- DA-VAE (da_factor=4) 能把 2K 图像压到和 1K 标准推理一样的 4096 tokens；新 VAE 做不到这点（16× 固定，无法按需扩展压缩比）
+- 若用新 VAE 做 2K 编辑，Transformer 需要处理 **16384 个 token**，是 1K 标准规模的 4 倍，推理成本高出 16 倍（注意力是二次方）
+
+---
+
+### 11.6 两种 conv_out 快捷路径的本质区别
+
+这是最微妙的架构差异，值得单独解释：
+
+**DA-VAE 的 DCDownBlock2d（conv_out 层之前）：**
+```
+主路径: Conv(512→64, s=1) → pixel_unshuffle(r=2) → [B, 256, H/2, W/2]
+快捷路径: pixel_unshuffle(r=2) → grouped_mean → [B, 256, H/2, W/2]
+结果: 空间 ÷2，通道 512 → 64（再 ×4 for unshuffle = 256 = 2×128 for μ+logσ²）
+```
+DCDown **同时** 做空间压缩和通道压缩，是真正的"双重压缩"。
+
+**新 VAE 的 Encode_conv_out_shortcut（factor=1）：**
+```
+主路径: Conv(512→128, k=3, s=1) → [B, 128, H, W]
+快捷路径: view(B, 128, 4, H, W).mean(dim=2) → [B, 128, H, W]
+结果: 空间不变，通道 512 → 128（纯通道压缩）
+```
+这里 factor=1 意味着 pixel_unshuffle 不产生空间变化，快捷路径退化为**纯通道平均**（就是个分组 1×1 卷积的零参数版本）。所有空间压缩已在之前的 4 个 downsample 阶段完成。
+
+这反映出两种不同的设计哲学：
+- DA-VAE：把空间压缩**集中在末端**（利用瓶颈层之前已有完整特征图的优势）
+- 新 VAE：把空间压缩**分散到全局**（每个 level 都降采，最后 conv_out 只做通道调整）
+
+---
+
+### 11.7 对 2K 编辑项目的影响
+
+**方案比较（目标：2K 图像，manageable token 预算）：**
+
+```
+方案 A：DA-VAE (da_factor=4) 挂载在 Flux 2 Klein 上
+  优势:
+    ✓ 2K 输入 → 4096 token（与 1K 标准 Flux 相同规模）
+    ✓ 可复用 Flux 预训练权重（Alignment Loss + Zero-init）
+    ✓ 新增参数极少（~600K DC blocks）
+    ✓ da_factor 可调，弹性扩展压缩比
+  劣势:
+    ✗ 需要 Alignment Loss 训练稳定 Detail Latent 分布
+    ✗ 依赖 Flux 的 8× VAE 作为基础
+
+方案 B：新 VAE（16×-64ch）+ 从头训练 DiT
+  优势:
+    ✓ 架构更干净，无依赖
+    ✓ 64 通道提供更大的信息容量
+    ✓ 下采样分布更均匀，每级感受野递增（UNet 风格）
+    ✓ 无需 Alignment Loss（无 pretrained Transformer 兼容问题）
+  劣势:
+    ✗ 2K 输入 → 16384 token（注意力成本 ×16，不可接受）
+    ✗ 无法直接复用 Flux 2 Klein 权重
+    ✗ 需要完整 DiT 训练（成本数量级更高）
+    ✗ 若要用于 2K，仍需叠加一层额外压缩（本质上又回到 DA-VAE 的路线）
+
+方案 C：新 VAE 用于 1K 中间表示，再叠加 DA-VAE 压缩做 2K
+  ┌──────────────────────────────────────────────────────┐
+  │  1K 图像 → 新 VAE(16×) → z[64, 64, 64] → DiT（1K规模）│
+  │  2K 图像 → 新 VAE(16×) → z[64, 128, 128]             │
+  │           → DCDown(da_factor=2) → z'[64, 64, 64]     │
+  │           → 同一个 DiT                               │
+  └──────────────────────────────────────────────────────┘
+  等价于在新 VAE 之上再做 DA-VAE 式的扩展
+  这是可行但复杂度高的路线
+
+─────────────────────────────────────────────
+推荐结论：
+  ● 如果基于 Flux 2 Klein → 选 DA-VAE (da_factor=4) 方案
+  ● 如果从头设计全新系统 → 新 VAE 是更好的 1K 基础，但 2K 必须额外处理 token 数
+  ● 新 VAE 的快捷路径设计思路可以借鉴移植到 Flux 的 DCDown/DCUp，替换现有的 grouped_mean 实现
+```
+
+---
+
+### 11.8 可借鉴的新 VAE 设计改进点
+
+新 VAE 相比 DA-VAE 有几个值得移植的设计细节：
+
+1. **`Downsample_shortcut_enlarge_ch`**：在下采样的同时扩展通道数，比 DA-VAE 的 DCDown 一步压缩更平滑
+2. **渐进式通道扩展** [128→256→512→512→512]：和 DC 块一步从 512 跳到 64 相比，梯度流动更稳定
+3. **`Encode_conv_out_shortcut`（factor=1）**：最后一步用纯通道平均作快捷路径，相当于一个"自由的 1×1 残差"，对训练初期稳定性有帮助
+4. **独立的 z_mean/z_std**：明确记录潜码统计，便于 DiT 归一化配置（DA-VAE 依赖 SD3 的 shift/scale，不够独立）
