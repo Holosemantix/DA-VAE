@@ -399,10 +399,10 @@ def main(args: EasyDict) -> None:
                     global_step,
                     last_layer=unwrap_model(accelerator, model).get_last_layer(),
                     split="train",
-                    z=extra["z_student_align"],
+                    z=extra["z_detail_align"],
                     aux_feature=extra["z_teacher"],
                     enc_last_layer=unwrap_model(accelerator, model).get_encoder_last_layer(),
-                    z_pe=extra["z_student"],
+                    z_pe=extra["z_detail"],
                     align_method=getattr(unwrap_model(accelerator, model), "align_method", "mean"),
                 )
 

@@ -59,7 +59,7 @@ total:   128 channels
 
 - 为什么 32x VAE 首选 `f32c128`。
 - 16x 到 32x 后 channel 变为 4 倍的原因。
-- teacher path 和 student path 的整体结构。
+- teacher/base path 和 detail/student path 的整体结构。
 - 32x student 如何复用现有 16x Swin VAE。
 - `DCDown2d` 如何把 16x encoder 的 `conv_out` 前高维 feature 压缩成 32x moments。
 - `DCUp2d` 如何把 32x latent 还原到原 16x decoder 的高维接入点。
@@ -166,8 +166,9 @@ extra["z_teacher"]        # B x 32  x H/32 x W/32
 extra["z_base"]           # B x 32  x H/32 x W/32
 extra["z_detail"]         # B x 96  x H/32 x W/32
 extra["z_combined"]       # B x 128 x H/32 x W/32
+extra["z_detail_align"]   # B x 32  x H/32 x W/32
 extra["z_student"]        # B x 96  x H/32 x W/32，兼容旧命名，实际是 z_detail
-extra["z_student_align"]  # B x 32  x H/32 x W/32
+extra["z_student_align"]  # B x 32  x H/32 x W/32，兼容旧命名，实际是 z_detail_align
 ```
 
 这些变量用于 DA-VAE 风格的语义对齐 loss。
@@ -220,9 +221,9 @@ loss_module(
     recon,
     posterior,
     optimizer_idx=0,
-    z=extra["z_student_align"],
+    z=extra["z_detail_align"],
     aux_feature=extra["z_teacher"],
-    z_pe=extra["z_student"],
+    z_pe=extra["z_detail"],
     align_method="mean",
 )
 ```
@@ -232,9 +233,9 @@ loss_module(
 - `pixel_values`：GT 图像。
 - `recon`：32x VAE 重建图像。
 - `posterior`：detail posterior，即 `q_detail(z_d|x)`。
-- `z_student_align`：detail latent 映射到 teacher channel 后的结果。
+- `z_detail_align`：detail latent 映射到 teacher channel 后的结果。
 - `z_teacher`：冻结 teacher/base latent，也是 concat 后的前 32 个通道。
-- `z_student`：兼容旧命名，实际是原始 32x detail latent。
+- `z_detail`：原始 32x detail latent。
 
 ## 新增文件四：`configs/vae32x/train_vae32x_from_edit_gt.yaml`
 
@@ -315,9 +316,9 @@ python3 -m py_compile lightningdit/tokenizer/vae32x_da.py tools/train_vae32x_fro
 ## 后续建议
 
 1. 先在训练环境跑 dummy dataset，确认模型能实例化、前反向能跑通。
-2. 打印并确认 `z_detail`/`z_student` shape 是 `B x 96 x H/32 x W/32`。
+2. 打印并确认 `z_detail` shape 是 `B x 96 x H/32 x W/32`。
 3. 打印并确认 `z_combined` shape 是 `B x 128 x H/32 x W/32`。
-4. 打印并确认 `z_student_align` 和 `z_teacher` shape 都是 `B x 32 x H/32 x W/32`。
+4. 打印并确认 `z_detail_align` 和 `z_teacher` shape 都是 `B x 32 x H/32 x W/32`。
 5. 先用 `align_method: mean` 得到稳定 baseline。
 6. 如果后续 DiT 输入通道压力太大，可以再做 `f32c64` ablation。
 7. Stage 1 收敛后，再进入 DiT/编辑模型适配阶段。

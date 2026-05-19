@@ -52,7 +52,7 @@ total:   128 channels
 32x DA-VAE 由两条路径组成：
 
 1. 冻结的 16x teacher path：提供语义对齐目标。
-2. 可训练的 32x student path：负责重建和最终编码/解码。
+2. 可训练的 32x detail/student path：产生新增 detail latent，并和 teacher/base latent 一起负责重建。
 
 整体结构：
 
@@ -253,7 +253,7 @@ disc_weight = 0.1
 第一版建议使用 MSE alignment：
 
 ```text
-L_align = MSE(z_student_align, z_teacher)
+L_align = MSE(z_detail_align, z_teacher)
 ```
 
 其中：
@@ -263,7 +263,7 @@ z_detail_align: B x 32 x H/32 x W/32
 z_teacher:      B x 32 x H/32 x W/32
 ```
 
-这对应 DA-VAE 里的 VF/semantic alignment 思想：让新的高压缩 latent 在语义结构上接近原模型可理解的 latent 空间。
+这对应 DA-VAE 里的 VF/semantic alignment 思想：让新增 detail latent 在语义结构上接近原模型可理解的 latent 空间。这里对齐的是 `z_detail` 映射后的 32 通道表示，不是整个 128 通道的 `z32`。
 
 ### 可选 PatchEmbed 对齐
 
@@ -280,7 +280,7 @@ L_patch_embed = MSE(PE_detail(z_detail), PE_teacher(z_teacher))
 ### Stage 0：初始化
 
 1. teacher 16x VAE 加载当前 f16c32 checkpoint，冻结。
-2. student 16x encoder/decoder 加载同一个 f16c32 checkpoint，默认冻结。
+2. detail/student 16x encoder/decoder 加载同一个 f16c32 checkpoint，默认冻结。
 3. 新增 `DCDown2d/DCUp2d` 随机初始化。
 4. `DCDown2d` 输出 `D=96` 个 detail latent channels。
 5. decoder 输入是 `concat([z_teacher, z_detail])`，总通道为 128。
@@ -294,7 +294,7 @@ L_patch_embed = MSE(PE_detail(z_detail), PE_teacher(z_teacher))
 训练 32x VAE 的重建能力 + 语义对齐能力
 ```
 
-默认只训练新增的 `DCDown2d/DCUp2d`，原 16x student encoder/decoder 和 teacher path 都冻结。这和 DA-VAE Stage 1 的训练方式一致：在预训练 VAE 的高维特征接口上学习新的压缩/解压缩接驳模块。
+默认只训练新增的 `DCDown2d/DCUp2d`，原 16x detail/student encoder/decoder 和 teacher path 都冻结。这和 DA-VAE Stage 1 的训练方式一致：在预训练 VAE 的高维特征接口上学习新的压缩/解压缩接驳模块。
 
 只使用编辑训练 dataloader 里的 GT 图像，默认：
 
