@@ -219,14 +219,22 @@ class DAVAE32xFrom16x(nn.Module):
         self.latent_channels_16x = int(latent_channels_16x)
         self.latent_channels_32x = int(latent_channels_32x)
         self.teacher_latent_channels = int(teacher_latent_channels)
+        self.detail_latent_channels = self.latent_channels_32x - self.teacher_latent_channels
+        if self.detail_latent_channels <= 0:
+            raise ValueError(
+                "latent_channels_32x must be larger than teacher_latent_channels; got "
+                f"{self.latent_channels_32x} and {self.teacher_latent_channels}"
+            )
         self.preconv_channels = int(preconv_channels)
         self.align_method = align_method
         self.pad_multiple = int(pad_multiple)
         self.teacher_downsample_mode = teacher_downsample_mode
+        self.freeze_student_encoder = bool(freeze_student_encoder)
+        self.freeze_student_decoder = bool(freeze_student_decoder)
 
         self.extra_down = DCDownBlock2d(
             in_channels=self.preconv_channels,
-            out_channels=2 * self.latent_channels_32x,
+            out_channels=2 * self.detail_latent_channels,
             factor=2,
             shortcut=True,
         )
@@ -238,13 +246,13 @@ class DAVAE32xFrom16x(nn.Module):
         )
 
         if self.align_method == "proj":
-            self.align_proj = nn.Conv2d(self.latent_channels_32x, self.teacher_latent_channels, 1)
+            self.align_proj = nn.Conv2d(self.detail_latent_channels, self.teacher_latent_channels, 1)
         else:
             self.align_proj = None
-            if self.latent_channels_32x % self.teacher_latent_channels != 0:
+            if self.detail_latent_channels % self.teacher_latent_channels != 0:
                 raise ValueError(
-                    "mean alignment requires latent_channels_32x to be divisible by "
-                    f"teacher_latent_channels, got {self.latent_channels_32x} and {self.teacher_latent_channels}"
+                    "mean alignment requires detail_latent_channels to be divisible by "
+                    f"teacher_latent_channels, got {self.detail_latent_channels} and {self.teacher_latent_channels}"
                 )
 
         self.config = SimpleNamespace(
@@ -257,6 +265,10 @@ class DAVAE32xFrom16x(nn.Module):
     def train(self, mode: bool = True):
         super().train(mode)
         self.teacher.eval()
+        if self.freeze_student_encoder and hasattr(self.student, "encoder"):
+            self.student.encoder.eval()
+        if self.freeze_student_decoder and hasattr(self.student, "decoder"):
+            self.student.decoder.eval()
         return self
 
     def _pad_image(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
@@ -333,12 +345,21 @@ class DAVAE32xFrom16x(nn.Module):
             h = torch.tanh(h)
         return h
 
-    def _align_student(self, z32: torch.Tensor) -> torch.Tensor:
+    def _align_detail(self, z_detail: torch.Tensor) -> torch.Tensor:
         if self.align_method == "proj":
-            return self.align_proj(z32)
-        bsz, channels, height, width = z32.shape
+            return self.align_proj(z_detail)
+        bsz, channels, height, width = z_detail.shape
         groups = channels // self.teacher_latent_channels
-        return z32.view(bsz, self.teacher_latent_channels, groups, height, width).mean(dim=2)
+        return z_detail.view(bsz, self.teacher_latent_channels, groups, height, width).mean(dim=2)
+
+    @staticmethod
+    def _concat_posteriors(
+        base_post: DiagonalGaussianDistribution,
+        detail_post: DiagonalGaussianDistribution,
+    ) -> DiagonalGaussianDistribution:
+        mean = torch.cat([base_post.mean, detail_post.mean], dim=1)
+        logvar = torch.cat([base_post.logvar, detail_post.logvar], dim=1)
+        return DiagonalGaussianDistribution(torch.cat([mean, logvar], dim=1))
 
     @torch.no_grad()
     def encode_teacher(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
@@ -355,11 +376,14 @@ class DAVAE32xFrom16x(nn.Module):
     def encode_student(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
         x, _ = self._pad_image(x)
         preconv16 = self._encode_student_preconv(x)
-        moments32 = self.extra_down(preconv16)
-        return DiagonalGaussianDistribution(moments32)
+        detail_moments32 = self.extra_down(preconv16)
+        return DiagonalGaussianDistribution(detail_moments32)
 
     def encode(self, x: torch.Tensor, return_dict: bool = True):
-        posterior = self.encode_student(x)
+        with torch.no_grad():
+            base_post = self.encode_teacher(x)
+        detail_post = self.encode_student(x)
+        posterior = self._concat_posteriors(base_post, detail_post)
         if not return_dict:
             return (posterior,)
         return SimpleNamespace(latent_dist=posterior)
@@ -375,19 +399,24 @@ class DAVAE32xFrom16x(nn.Module):
         x_pad, (org_h, org_w) = self._pad_image(x)
         with torch.no_grad():
             teacher_post = self.encode_teacher(x)
-            z_teacher = teacher_post.mode().detach()
+            z_base = teacher_post.mode().detach()
 
-        student_post = self.encode_student(x_pad)
-        z32 = student_post.sample() if sample_posterior else student_post.mode()
-        z32_align = self._align_student(z32)
+        detail_post = self.encode_student(x_pad)
+        z_detail = detail_post.sample() if sample_posterior else detail_post.mode()
+        z_detail_align = self._align_detail(z_detail)
+        z32 = torch.cat([z_base, z_detail], dim=1)
 
         recon = self.decode(z32, return_dict=False)[0]
         recon = recon[..., :org_h, :org_w]
-        return recon, student_post, {
+        return recon, detail_post, {
             "teacher_posterior": teacher_post,
-            "z_teacher": z_teacher,
-            "z_student": z32,
-            "z_student_align": z32_align,
+            "z_teacher": z_base,
+            "z_base": z_base,
+            "z_detail": z_detail,
+            "z_detail_align": z_detail_align,
+            "z_combined": z32,
+            "z_student": z_detail,
+            "z_student_align": z_detail_align,
         }
 
     def get_last_layer(self):

@@ -36,6 +36,17 @@ H/32 x W/32
 
 如果后续为了降低 DiT 输入通道或显存，也可以试 `f32c64`，但它会把总 latent 容量降到原 16x 的一半，更适合作为轻量 ablation，而不是首选主方案。
 
+按论文 Fig.2 的显式布局，`f32c128` 不是 128 个通道都由 student/detail encoder 产生，而是：
+
+```text
+z32 = concat([z_base, z_detail], dim=channel)
+z_base:   32 channels，来自冻结 16x teacher/base VAE
+z_detail: 96 channels，来自新增 32x detail encoder
+total:   128 channels
+```
+
+也就是 `C=32, D=96, C+D=128`。论文 ImageNet 设置同样采用 `C=32, D=96`，总通道数为 128。
+
 ## 总体网络结构
 
 32x DA-VAE 由两条路径组成：
@@ -48,11 +59,12 @@ H/32 x W/32
 ```text
 输入图像 x
   ├─ teacher path: resize 到 1/2 分辨率 -> 冻结 16x VAE encoder -> z_teacher
-  └─ student path: 原 16x VAE encoder 的 conv_out 前高维特征 -> 额外 2x deep-compress -> z32
+  └─ detail path: 原 16x VAE encoder 的 conv_out 前高维特征 -> 额外 2x deep-compress -> z_detail
 
-z32 -> alignment head -> z_student_align
-z_student_align 与 z_teacher 做语义对齐
+z_detail -> grouped mean/proj -> z_detail_align
+z_detail_align 与 z_teacher 做语义对齐
 
+concat([z_teacher, z_detail]) -> z32
 z32 -> 额外 2x deep-uncompress -> 原 16x VAE decoder 的 conv_in 后接入点 -> 重建图像 x_rec
 ```
 
@@ -98,22 +110,24 @@ preconv16: B x 2048 x H/16 x W/16
 
 这里的 2048 来自原 encoder bottleneck 的 512 通道经过 `2x patchify` 后变成 `512 * 2 * 2`。这个位置的信息量明显高于最终 `conv_out` 后的 64 moments 通道，更符合 DA-VAE 的构建方式。
 
-为了得到 32x latent，在 `preconv16` 后新增一个 DA-style deep-compress block：
+为了得到 32x detail latent，在 `preconv16` 后新增一个 DA-style deep-compress block：
 
 ```text
 preconv16: B x 2048 x H/16 x W/16
 DCDown2d:  conv + pixel_unshuffle shortcut, factor=2
-moments32: B x 256 x H/32 x W/32
-posterior q_32(z|x) = DiagonalGaussian(moments32)
-z32:       B x 128 x H/32 x W/32
+moments_detail: B x 192 x H/32 x W/32
+posterior q_detail(z_d|x) = DiagonalGaussian(moments_detail)
+z_detail:       B x 96  x H/32 x W/32
 ```
 
 默认通道配置：
 
 ```text
 preconv_channels = 2048
-C32 = 128
-moments32 channels = 2 * 128 = 256
+C = teacher/base channels = 32
+D = detail channels = 96
+C + D = total 32x latent channels = 128
+detail moments channels = 2 * 96 = 192
 ```
 
 ## 32x Decoder
@@ -121,6 +135,7 @@ moments32 channels = 2 * 128 = 256
 decoder 做上述过程的镜像。先把 32x latent 还原到原 16x decoder 的高维 preconv 特征，再跳过原 decoder 的 `conv_in`，从 mid/up blocks 开始解码：
 
 ```text
+z32 = concat([z_teacher, z_detail])
 z32:      B x 128 x H/32 x W/32
 DCUp2d:   conv + pixel_shuffle shortcut, factor=2
 preconv16_hat: B x 2048 x H/16 x W/16
@@ -138,38 +153,38 @@ x_rec:    B x 3   x H    x W
 
 ## Alignment Head
 
-student latent 的 channel 是 128，teacher latent 的 channel 是 32，因此需要一个 alignment head：
+alignment 只作用在新增的 detail latent 上，而不是整个 128 通道 latent 上。这一点和论文 Fig.2 保持一致：base latent 直接来自 teacher，detail latent 通过对齐损失学习 teacher latent 的结构。
 
 ```text
-z32:             B x 128 x H/32 x W/32
-z_student_align: B x 32  x H/32 x W/32
-z_teacher:       B x 32  x H/32 x W/32
+z_detail:       B x 96 x H/32 x W/32
+z_detail_align: B x 32 x H/32 x W/32
+z_teacher:      B x 32 x H/32 x W/32
 ```
 
 支持两种方式：
 
 ### `mean`
 
-把 128 个 channel 分成 32 组，每组 4 个 channel，对组内取均值：
+把 96 个 detail channel 分成 32 组，每组 3 个 channel，对组内取均值：
 
 ```text
-128 -> 32
+96 -> 32
 ```
 
 优点：
 
 - 无额外参数。
-- 和 `32 -> 128` 的 4 倍通道扩展天然匹配。
+- 和 `C=32, D=96` 的 4 倍总通道扩展天然匹配。
 - 第一阶段训练更稳定。
 
 第一版默认使用 `mean`。
 
 ### `proj`
 
-使用可学习的 `1x1 Conv2d(128, 32)`：
+使用可学习的 `1x1 Conv2d(96, 32)`：
 
 ```text
-z_student_align = Conv1x1(z32)
+z_detail_align = Conv1x1(z_detail)
 ```
 
 优点是表达能力更强，缺点是多了一个可学习映射，早期训练可能比 `mean` 更不稳定。建议在 `mean` baseline 稳定后再尝试。
@@ -197,16 +212,16 @@ L_rec = |x - x_rec| + lambda_lpips * LPIPS(x, x_rec)
 
 ### KL 损失
 
-student posterior 是 32x KL posterior：
+student/detail posterior 是 32x KL posterior：
 
 ```text
-q_32(z|x) = DiagonalGaussian(moments32)
+q_detail(z_d|x) = DiagonalGaussian(moments_detail)
 ```
 
 KL loss：
 
 ```text
-L_kl = KL(q_32(z|x) || N(0, I))
+L_kl = KL(q_detail(z_d|x) || N(0, I))
 ```
 
 建议初始权重：
@@ -244,8 +259,8 @@ L_align = MSE(z_student_align, z_teacher)
 其中：
 
 ```text
-z_student_align: B x 32 x H/32 x W/32
-z_teacher:       B x 32 x H/32 x W/32
+z_detail_align: B x 32 x H/32 x W/32
+z_teacher:      B x 32 x H/32 x W/32
 ```
 
 这对应 DA-VAE 里的 VF/semantic alignment 思想：让新的高压缩 latent 在语义结构上接近原模型可理解的 latent 空间。
@@ -255,7 +270,7 @@ z_teacher:       B x 32 x H/32 x W/32
 后续进入 DiT 适配阶段时，可以增加 PatchEmbed 对齐：
 
 ```text
-L_patch_embed = MSE(PE_student(z32), PE_teacher(z_teacher))
+L_patch_embed = MSE(PE_detail(z_detail), PE_teacher(z_teacher))
 ```
 
 这一步主要用于让 DiT 的输入投影层更快适配 32x latent。当前 Stage 1 不是必须。
@@ -267,7 +282,9 @@ L_patch_embed = MSE(PE_student(z32), PE_teacher(z_teacher))
 1. teacher 16x VAE 加载当前 f16c32 checkpoint，冻结。
 2. student 16x encoder/decoder 加载同一个 f16c32 checkpoint，默认冻结。
 3. 新增 `DCDown2d/DCUp2d` 随机初始化。
-4. 默认 alignment 使用 `mean`，不新增 alignment 参数。
+4. `DCDown2d` 输出 `D=96` 个 detail latent channels。
+5. decoder 输入是 `concat([z_teacher, z_detail])`，总通道为 128。
+6. 默认 alignment 使用 `mean`，不新增 alignment 参数。
 
 ### Stage 1：只训练 32x VAE
 
@@ -301,6 +318,9 @@ batch["edited_img"]
 latent: f32c128
 optimizer: AdamW
 lr: 1e-4
+betas: [0.5, 0.9]
+batch size: 128 in paper ImageNet setting; adjust by hardware
+training steps: 100K in paper ImageNet setting
 kl_weight: 1e-6
 disc_start: 5001
 disc_weight: 0.1
@@ -309,6 +329,15 @@ mixed_precision: bf16
 align_method: mean
 ```
 
+论文附录 Table S1 中 DA-VAE Training 的两组参考超参如下：
+
+| 场景 | lr | batch size | steps | optimizer | loss weights `(lambda_LPIPS, lambda_L1, lambda_adv, lambda_KL, lambda_align)` |
+| --- | ---: | ---: | ---: | --- | --- |
+| LightningDiT-XL / ImageNet | `1e-4` | `128` | `100K` | AdamW, betas=`[0.5, 0.9]` | `(1.0, 1.0, 0.1, 1e-6, 0.5)` |
+| SD3.5-M / text-to-image | `1e-4` | `16` | `10K` | AdamW, betas=`[0.9, 0.999]` | `(1.0, 2.0, 0.1, 1e-7, 1.0)` |
+
+当前 32x 方案采用 `C=32, D=96, total=128`，和论文 ImageNet tokenizer 设置更接近，因此默认配置按第一行设置；如果训练的是 SD3.5/Flux2 Klein 高分辨率编辑数据，可以参考第二行把 L1 和 alignment 权重调高，同时降低 KL 权重。
+
 需要重点检查：
 
 1. reconstruction grid：GT vs reconstruction。
@@ -316,8 +345,9 @@ align_method: mean
 3. `train/kl_loss`。
 4. `train/vf_loss`。
 5. `train/disc_loss`。
-6. latent shape 是否为 `B x 128 x H/32 x W/32`。
-7. `z_student_align` 和 `z_teacher` 是否都是 `B x 32 x H/32 x W/32`。
+6. `z_detail` shape 是否为 `B x 96 x H/32 x W/32`。
+7. `z_combined` shape 是否为 `B x 128 x H/32 x W/32`。
+8. `z_detail_align` 和 `z_teacher` 是否都是 `B x 32 x H/32 x W/32`。
 
 ### Stage 2：和 DiT/编辑模型适配
 

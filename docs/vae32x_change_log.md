@@ -42,6 +42,17 @@ f32c128: 128 x H/32 x W/32
 
 所以本次已经把默认配置和代码默认值从 `64` 调整为 `128`。
 
+同时按论文 Fig.2 修正为显式 `base + detail` 结构：
+
+```text
+z32 = concat([z_base, z_detail], dim=channel)
+z_base:   32 channels，来自冻结 teacher/base VAE
+z_detail: 96 channels，来自新增 detail encoder
+total:   128 channels
+```
+
+因此新增 detail 分支不是输出 128 channels，而是输出 96 channels；32 个 base channels 直接来自 teacher，并和 96 个 detail channels concat 后一起参与重建训练。
+
 ## 新增文件一：`docs/vae32x_architecture.md`
 
 这是 32x VAE 的中文网络架构设计文档，主要写清楚：
@@ -73,14 +84,14 @@ f32c128: 128 x H/32 x W/32
 
 ```text
 输入 preconv16: B x 2048 x H/16 x W/16
-输出 moments32: B x 256  x H/32 x W/32
+输出 moments_detail: B x 192 x H/32 x W/32
 ```
 
 其中：
 
 ```text
 2048 = 512 * 2 * 2，来自原 16x Swin VAE encoder 的 patchified 高维特征
-256  = 2 * C32 = 2 * 128
+192  = 2 * D = 2 * 96
 ```
 
 内部结构：
@@ -102,7 +113,7 @@ shortcut: pixel_unshuffle(factor=2) -> channel group/proj
 默认输入输出：
 
 ```text
-输入 z32:            B x 128  x H/32 x W/32
+输入 z32:            B x 128  x H/32 x W/32  # concat([z_base, z_detail])
 输出 preconv16_hat:  B x 2048 x H/16 x W/16
 ```
 
@@ -130,7 +141,8 @@ shortcut: channel repeat -> pixel_shuffle(factor=2)
 - `teacher`
   - 冻结。
   - 加载现有 16x VAE checkpoint。
-  - 输入半分辨率 GT 图像，输出和 student 32x latent 空间尺寸一致的 teacher latent。
+  - 输入半分辨率 GT 图像，输出和 detail latent 空间尺寸一致的 `z_base/z_teacher`。
+  - `z_base` 作为最终 32x latent 的前 32 个通道直接参与重建。
 
 关键接口：
 
@@ -151,7 +163,10 @@ recon, student_posterior, extra
 
 ```python
 extra["z_teacher"]        # B x 32  x H/32 x W/32
-extra["z_student"]        # B x 128 x H/32 x W/32
+extra["z_base"]           # B x 32  x H/32 x W/32
+extra["z_detail"]         # B x 96  x H/32 x W/32
+extra["z_combined"]       # B x 128 x H/32 x W/32
+extra["z_student"]        # B x 96  x H/32 x W/32，兼容旧命名，实际是 z_detail
 extra["z_student_align"]  # B x 32  x H/32 x W/32
 ```
 
@@ -216,10 +231,10 @@ loss_module(
 
 - `pixel_values`：GT 图像。
 - `recon`：32x VAE 重建图像。
-- `posterior`：32x KL posterior。
-- `z_student_align`：student latent 映射到 teacher channel 后的结果。
-- `z_teacher`：冻结 teacher latent。
-- `z_student`：原始 32x student latent。
+- `posterior`：detail posterior，即 `q_detail(z_d|x)`。
+- `z_student_align`：detail latent 映射到 teacher channel 后的结果。
+- `z_teacher`：冻结 teacher/base latent，也是 concat 后的前 32 个通道。
+- `z_student`：兼容旧命名，实际是原始 32x detail latent。
 
 ## 新增文件四：`configs/vae32x/train_vae32x_from_edit_gt.yaml`
 
@@ -300,8 +315,9 @@ python3 -m py_compile lightningdit/tokenizer/vae32x_da.py tools/train_vae32x_fro
 ## 后续建议
 
 1. 先在训练环境跑 dummy dataset，确认模型能实例化、前反向能跑通。
-2. 打印并确认 `z_student` shape 是 `B x 128 x H/32 x W/32`。
-3. 打印并确认 `z_student_align` 和 `z_teacher` shape 都是 `B x 32 x H/32 x W/32`。
-4. 先用 `align_method: mean` 得到稳定 baseline。
-5. 如果后续 DiT 输入通道压力太大，可以再做 `f32c64` ablation。
-6. Stage 1 收敛后，再进入 DiT/编辑模型适配阶段。
+2. 打印并确认 `z_detail`/`z_student` shape 是 `B x 96 x H/32 x W/32`。
+3. 打印并确认 `z_combined` shape 是 `B x 128 x H/32 x W/32`。
+4. 打印并确认 `z_student_align` 和 `z_teacher` shape 都是 `B x 32 x H/32 x W/32`。
+5. 先用 `align_method: mean` 得到稳定 baseline。
+6. 如果后续 DiT 输入通道压力太大，可以再做 `f32c64` ablation。
+7. Stage 1 收敛后，再进入 DiT/编辑模型适配阶段。

@@ -7,7 +7,7 @@ args:
   yml_path: "configs/vae32x/train_vae32x_from_edit_gt.yaml"
 
   image_key: "edited_img"
-  train_batch_size: 4
+  train_batch_size: 16
   num_train_epochs: 1
   max_train_steps: 100000
   gradient_accumulation_steps: 1
@@ -15,8 +15,8 @@ args:
   discriminator_learning_rate: 1.0e-4
   lr_scheduler: "constant"
   lr_warmup_steps: 0
-  adam_beta1: 0.9
-  adam_beta2: 0.99
+  adam_beta1: 0.5
+  adam_beta2: 0.9
   adam_weight_decay: 0.0
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
