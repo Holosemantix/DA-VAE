@@ -48,12 +48,12 @@ H/32 x W/32
 ```text
 输入图像 x
   ├─ teacher path: resize 到 1/2 分辨率 -> 冻结 16x VAE encoder -> z_teacher
-  └─ student path: 原 16x VAE encoder -> 额外 2x deep-compress -> z32
+  └─ student path: 原 16x VAE encoder 的 conv_out 前高维特征 -> 额外 2x deep-compress -> z32
 
 z32 -> alignment head -> z_student_align
 z_student_align 与 z_teacher 做语义对齐
 
-z32 -> 额外 2x deep-uncompress -> 原 16x VAE decoder -> 重建图像 x_rec
+z32 -> 额外 2x deep-uncompress -> 原 16x VAE decoder 的 conv_in 后接入点 -> 重建图像 x_rec
 ```
 
 ## 冻结 Teacher Path
@@ -85,21 +85,23 @@ Conv stem
   -> ResBlock down stages
   -> Swin bottleneck
   -> 2x patchify
+  -> 16x preconv feature
+  -> conv_out
   -> 16x Gaussian moments
 ```
 
-原始 16x moments：
+DA-VAE 的关键是不要在已经被 `conv_out` 压成 64 个 moments 通道之后再压缩，而是在 `conv_out` 之前的高维特征处插入 `DCDown2d`。对于你给的 16x Swin VAE，这个截断点是：
 
 ```text
-moments16: B x 64 x H/16 x W/16
+preconv16: B x 2048 x H/16 x W/16
 ```
 
-这里 64 是 `2 * C16`，其中 `C16 = 32`，前半是 mean，后半是 logvar。
+这里的 2048 来自原 encoder bottleneck 的 512 通道经过 `2x patchify` 后变成 `512 * 2 * 2`。这个位置的信息量明显高于最终 `conv_out` 后的 64 moments 通道，更符合 DA-VAE 的构建方式。
 
-为了得到 32x latent，在 16x moments 后新增一个 DA-style deep-compress block：
+为了得到 32x latent，在 `preconv16` 后新增一个 DA-style deep-compress block：
 
 ```text
-moments16: B x 64  x H/16 x W/16
+preconv16: B x 2048 x H/16 x W/16
 DCDown2d:  conv + pixel_unshuffle shortcut, factor=2
 moments32: B x 256 x H/32 x W/32
 posterior q_32(z|x) = DiagonalGaussian(moments32)
@@ -109,21 +111,21 @@ z32:       B x 128 x H/32 x W/32
 默认通道配置：
 
 ```text
-C16 = 32
+preconv_channels = 2048
 C32 = 128
-moments16 channels = 2 * 32  = 64
 moments32 channels = 2 * 128 = 256
 ```
 
 ## 32x Decoder
 
-decoder 做上述过程的镜像。先把 32x latent 还原到原 16x decoder 所需的 latent，再走现有 16x decoder：
+decoder 做上述过程的镜像。先把 32x latent 还原到原 16x decoder 的高维 preconv 特征，再跳过原 decoder 的 `conv_in`，从 mid/up blocks 开始解码：
 
 ```text
 z32:      B x 128 x H/32 x W/32
 DCUp2d:   conv + pixel_shuffle shortcut, factor=2
-z16_hat:  B x 32  x H/16 x W/16
-decoder:  原 16x Swin VAE decoder
+preconv16_hat: B x 2048 x H/16 x W/16
+unpatchify:    B x 512  x H/8  x W/8
+decoder:       原 16x Swin VAE decoder 的 mid/up/end
 x_rec:    B x 3   x H    x W
 ```
 
@@ -132,6 +134,7 @@ x_rec:    B x 3   x H    x W
 1. 大部分已有 16x VAE 权重可以直接复用。
 2. 新增参数集中在 `DCDown2d/DCUp2d/alignment head`，调试边界清楚。
 3. 32x latent 的空间 token 数减少 4 倍，后续接 DiT 时 token 压力显著降低。
+4. 压缩发生在 `conv_out` 前的信息富集位置，而不是在最终 moments 后继续压缩。
 
 ## Alignment Head
 
@@ -339,4 +342,3 @@ Stage 1 收敛后，再把编辑模型里的 VAE 替换为这个 32x VAE。此�
 - reference/degraded/mask 条件。
 - prompt dropout/CFG。
 - flow matching loss。
-

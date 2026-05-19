@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 
 def _ensure_ldm_on_path() -> None:
@@ -189,6 +190,7 @@ class DAVAE32xFrom16x(nn.Module):
         latent_channels_16x: int = 32,
         latent_channels_32x: int = 128,
         teacher_latent_channels: int = 32,
+        preconv_channels: int = 2048,
         align_method: str = "mean",
         pad_multiple: int = 32,
         teacher_downsample_mode: str = "bicubic",
@@ -217,19 +219,20 @@ class DAVAE32xFrom16x(nn.Module):
         self.latent_channels_16x = int(latent_channels_16x)
         self.latent_channels_32x = int(latent_channels_32x)
         self.teacher_latent_channels = int(teacher_latent_channels)
+        self.preconv_channels = int(preconv_channels)
         self.align_method = align_method
         self.pad_multiple = int(pad_multiple)
         self.teacher_downsample_mode = teacher_downsample_mode
 
         self.extra_down = DCDownBlock2d(
-            in_channels=2 * self.latent_channels_16x,
+            in_channels=self.preconv_channels,
             out_channels=2 * self.latent_channels_32x,
             factor=2,
             shortcut=True,
         )
         self.extra_up = DCUpBlock2d(
             in_channels=self.latent_channels_32x,
-            out_channels=self.latent_channels_16x,
+            out_channels=self.preconv_channels,
             factor=2,
             shortcut=True,
         )
@@ -271,10 +274,64 @@ class DAVAE32xFrom16x(nn.Module):
             raise AttributeError("The wrapped 16x VAE must expose an `encoder` module.")
         return ae.encoder(x)
 
-    def _decode_16x(self, z16: torch.Tensor) -> torch.Tensor:
+    def _encode_student_preconv(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the provided 16x encoder up to the feature before conv_out.
+
+        This mirrors DA-VAE's insertion point: after encoder norm/activation and
+        before the Gaussian moments projection. For the provided Swin VAE this
+        is the 2x patchified high-channel feature at 16x spatial stride.
+        """
+        if not hasattr(self.student, "encoder"):
+            raise AttributeError("The wrapped 16x VAE must expose an `encoder` module.")
+        e = self.student.encoder
+        temb = None
+
+        h = e.conv_in(x)
+        for i_level in range(e.num_resolutions):
+            for i_block in range(e.num_res_blocks[i_level]):
+                h = e.down[i_level].block[i_block](h, temb)
+                if len(e.down[i_level].attn) > 0:
+                    h = e.down[i_level].attn[i_block](h)
+            if i_level != e.num_resolutions - 1:
+                h = e.down[i_level].downsample(h)
+
+        h = e.mid.block_1(h, temb)
+        h = e.mid.attn_1(h)
+        h = e.mid.block_2(h, temb)
+        h = rearrange(h, "b c (h dh) (w dw) -> b (c dh dw) h w", dh=2, dw=2)
+        h = e.norm_out(h)
+        h = F.silu(h)
+        return h
+
+    def _decode_from_student_preconv(self, h: torch.Tensor) -> torch.Tensor:
         if not hasattr(self.student, "decoder"):
             raise AttributeError("The wrapped 16x VAE must expose a `decoder` module.")
-        return self.student.decoder(z16)
+        d = self.student.decoder
+        temb = None
+
+        h = rearrange(h, "b (c dh dw) h w -> b c (h dh) (w dw)", dh=2, dw=2)
+
+        h = d.mid.block_1(h, temb)
+        h = d.mid.attn_1(h)
+        h = d.mid.block_2(h, temb)
+
+        for i_level in reversed(range(d.num_resolutions)):
+            for i_block in range(d.num_res_blocks[i_level] + 1):
+                h = d.up[i_level].block[i_block](h, temb)
+                if len(d.up[i_level].attn) > 0:
+                    h = d.up[i_level].attn[i_block](h)
+            if i_level != 0:
+                h = d.up[i_level].upsample(h)
+
+        if getattr(d, "give_pre_end", False):
+            return h
+
+        h = d.norm_out(h)
+        h = F.silu(h)
+        h = d.conv_out(h)
+        if getattr(d, "tanh_out", False):
+            h = torch.tanh(h)
+        return h
 
     def _align_student(self, z32: torch.Tensor) -> torch.Tensor:
         if self.align_method == "proj":
@@ -297,8 +354,8 @@ class DAVAE32xFrom16x(nn.Module):
 
     def encode_student(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
         x, _ = self._pad_image(x)
-        moments16 = self._encode_16x_moments(self.student, x)
-        moments32 = self.extra_down(moments16)
+        preconv16 = self._encode_student_preconv(x)
+        moments32 = self.extra_down(preconv16)
         return DiagonalGaussianDistribution(moments32)
 
     def encode(self, x: torch.Tensor, return_dict: bool = True):
@@ -308,8 +365,8 @@ class DAVAE32xFrom16x(nn.Module):
         return SimpleNamespace(latent_dist=posterior)
 
     def decode(self, z: torch.Tensor, return_dict: bool = True):
-        z16 = self.extra_up(z)
-        dec = self._decode_16x(z16)
+        preconv16 = self.extra_up(z)
+        dec = self._decode_from_student_preconv(preconv16)
         if not return_dict:
             return (dec,)
         return dec

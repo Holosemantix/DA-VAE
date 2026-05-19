@@ -50,8 +50,8 @@ f32c128: 128 x H/32 x W/32
 - 16x 到 32x 后 channel 变为 4 倍的原因。
 - teacher path 和 student path 的整体结构。
 - 32x student 如何复用现有 16x Swin VAE。
-- `DCDown2d` 如何把 16x moments 压缩成 32x moments。
-- `DCUp2d` 如何把 32x latent 还原给原 16x decoder。
+- `DCDown2d` 如何把 16x encoder 的 `conv_out` 前高维 feature 压缩成 32x moments。
+- `DCUp2d` 如何把 32x latent 还原到原 16x decoder 的高维接入点。
 - alignment head 为什么默认使用 `mean`。
 - 损失函数如何保持和 DA-VAE 一致。
 - Stage 0、Stage 1、Stage 2 的训练思路。
@@ -66,21 +66,21 @@ f32c128: 128 x H/32 x W/32
 功能：
 
 ```text
-16x Gaussian moments -> 32x Gaussian moments
+16x preconv feature -> 32x Gaussian moments
 ```
 
 默认输入输出：
 
 ```text
-输入 moments16: B x 64  x H/16 x W/16
-输出 moments32: B x 256 x H/32 x W/32
+输入 preconv16: B x 2048 x H/16 x W/16
+输出 moments32: B x 256  x H/32 x W/32
 ```
 
 其中：
 
 ```text
-64  = 2 * C16  = 2 * 32
-256 = 2 * C32  = 2 * 128
+2048 = 512 * 2 * 2，来自原 16x Swin VAE encoder 的 patchified 高维特征
+256  = 2 * C32 = 2 * 128
 ```
 
 内部结构：
@@ -96,14 +96,14 @@ shortcut: pixel_unshuffle(factor=2) -> channel group/proj
 功能：
 
 ```text
-32x latent -> 原 16x decoder latent
+32x latent -> 原 16x decoder 的 preconv 接入特征
 ```
 
 默认输入输出：
 
 ```text
-输入 z32:     B x 128 x H/32 x W/32
-输出 z16_hat: B x 32  x H/16 x W/16
+输入 z32:            B x 128  x H/32 x W/32
+输出 preconv16_hat:  B x 2048 x H/16 x W/16
 ```
 
 内部结构：
@@ -123,7 +123,8 @@ shortcut: channel repeat -> pixel_shuffle(factor=2)
 - `student`
   - 可训练。
   - 复用现有 16x VAE encoder/decoder。
-  - 新增 `extra_down` 和 `extra_up`。
+  - 在 encoder `conv_out` 前新增 `extra_down`。
+  - 在 decoder `conv_in` 后的高维接入点前新增 `extra_up`。
 
 - `teacher`
   - 冻结。
@@ -229,6 +230,7 @@ loss_module(
 latent_channels_16x: 32
 latent_channels_32x: 128
 teacher_latent_channels: 32
+preconv_channels: 2048
 align_method: "mean"
 ```
 
@@ -300,4 +302,3 @@ python3 -m py_compile lightningdit/tokenizer/vae32x_da.py tools/train_vae32x_fro
 4. 先用 `align_method: mean` 得到稳定 baseline。
 5. 如果后续 DiT 输入通道压力太大，可以再做 `f32c64` ablation。
 6. Stage 1 收敛后，再进入 DiT/编辑模型适配阶段。
-

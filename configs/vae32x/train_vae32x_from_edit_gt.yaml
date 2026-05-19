@@ -40,6 +40,7 @@ model:
     latent_channels_16x: 32
     latent_channels_32x: 128
     teacher_latent_channels: 32
+    preconv_channels: 2048
     align_method: "mean"
     pad_multiple: 32
     student_config:
