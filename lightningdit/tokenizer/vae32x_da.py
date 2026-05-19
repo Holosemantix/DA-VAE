@@ -187,7 +187,7 @@ class DAVAE32xFrom16x(nn.Module):
         student_ckpt_path: Optional[str] = None,
         teacher_ckpt_path: Optional[str] = None,
         latent_channels_16x: int = 32,
-        latent_channels_32x: int = 64,
+        latent_channels_32x: int = 128,
         teacher_latent_channels: int = 32,
         align_method: str = "mean",
         pad_multiple: int = 32,
@@ -346,4 +346,3 @@ class DAVAE32xFrom16x(nn.Module):
         path = os.path.join(output_dir, "vae32x_da.pt")
         torch.save(self.state_dict(), path)
         return path
-

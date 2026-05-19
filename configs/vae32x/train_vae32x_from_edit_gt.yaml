@@ -38,7 +38,7 @@ model:
     student_ckpt_path: "/path/to/current_f16c32_vae.pth"
     teacher_ckpt_path: "/path/to/current_f16c32_vae.pth"
     latent_channels_16x: 32
-    latent_channels_32x: 64
+    latent_channels_32x: 128
     teacher_latent_channels: 32
     align_method: "mean"
     pad_multiple: 32
@@ -88,4 +88,3 @@ loss:
     vf_proj_use_mse: true
     distmat_margin: 0.0
     cos_margin: 0.0
-
