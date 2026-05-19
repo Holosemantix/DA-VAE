@@ -195,8 +195,8 @@ class DAVAE32xFrom16x(nn.Module):
         pad_multiple: int = 32,
         teacher_downsample_mode: str = "bicubic",
         strict_load: bool = False,
-        freeze_student_encoder: bool = False,
-        freeze_student_decoder: bool = False,
+        freeze_student_encoder: bool = True,
+        freeze_student_decoder: bool = True,
     ) -> None:
         super().__init__()
         if align_method not in ("mean", "proj"):

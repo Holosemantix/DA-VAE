@@ -121,10 +121,11 @@ shortcut: channel repeat -> pixel_shuffle(factor=2)
 它包含：
 
 - `student`
-  - 可训练。
   - 复用现有 16x VAE encoder/decoder。
+  - 默认冻结原 16x encoder/decoder。
   - 在 encoder `conv_out` 前新增 `extra_down`。
   - 在 decoder `conv_in` 后的高维接入点前新增 `extra_up`。
+  - 默认只训练新增的 `extra_down/extra_up`。
 
 - `teacher`
   - 冻结。
@@ -232,6 +233,8 @@ latent_channels_32x: 128
 teacher_latent_channels: 32
 preconv_channels: 2048
 align_method: "mean"
+freeze_student_encoder: true
+freeze_student_decoder: true
 ```
 
 需要你根据真实训练环境修改的字段：

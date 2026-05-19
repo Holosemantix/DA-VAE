@@ -265,7 +265,7 @@ L_patch_embed = MSE(PE_student(z32), PE_teacher(z_teacher))
 ### Stage 0：初始化
 
 1. teacher 16x VAE 加载当前 f16c32 checkpoint，冻结。
-2. student 16x encoder/decoder 加载同一个 f16c32 checkpoint，可训练。
+2. student 16x encoder/decoder 加载同一个 f16c32 checkpoint，默认冻结。
 3. 新增 `DCDown2d/DCUp2d` 随机初始化。
 4. 默认 alignment 使用 `mean`，不新增 alignment 参数。
 
@@ -276,6 +276,8 @@ L_patch_embed = MSE(PE_student(z32), PE_teacher(z_teacher))
 ```text
 训练 32x VAE 的重建能力 + 语义对齐能力
 ```
+
+默认只训练新增的 `DCDown2d/DCUp2d`，原 16x student encoder/decoder 和 teacher path 都冻结。这和 DA-VAE Stage 1 的训练方式一致：在预训练 VAE 的高维特征接口上学习新的压缩/解压缩接驳模块。
 
 只使用编辑训练 dataloader 里的 GT 图像，默认：
 

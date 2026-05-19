@@ -43,6 +43,8 @@ model:
     preconv_channels: 2048
     align_method: "mean"
     pad_multiple: 32
+    freeze_student_encoder: true
+    freeze_student_decoder: true
     student_config:
       target: f16c32_vae_swin_dinov3_dec.autoencoder_2d_16x_5layer_ResBlockList_swin_2d.AutoencoderKL
       params:
