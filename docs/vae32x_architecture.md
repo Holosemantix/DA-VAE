@@ -68,6 +68,188 @@ concat([z_teacher, z_detail]) -> z32
 z32 -> 额外 2x deep-uncompress -> 原 16x VAE decoder 的 conv_in 后接入点 -> 重建图像 x_rec
 ```
 
+## 原始 16x 与新增 32x 架构图对比
+
+这一节明确画出原始 16x VAE 的压缩路径，以及 32x DA-VAE 是在什么位置继续做 2x 降采样。
+
+### 原始 16x VAE 网络结构
+
+原始 16x VAE 的 encoder 在 Swin bottleneck 后会先做一次 `2x patchify`，得到 `H/16 x W/16` 的高维 feature，然后通过 `conv_out` 压成 16x latent moments：
+
+```text
+输入图像 x
+B x 3 x H x W
+    |
+    v
+conv_in
+B x 128 x H x W
+    |
+    v
+Down stage 0: ResBlocks + Downsample x2, channel 128 -> 256
+B x 256 x H/2 x W/2
+    |
+    v
+Down stage 1: ResBlocks + Downsample x2, channel 256 -> 512
+B x 512 x H/4 x W/4
+    |
+    v
+Down stage 2: ResBlocks + Downsample x2, channel 512 -> 512
+B x 512 x H/8 x W/8
+    |
+    v
+Down stage 3: ResBlocks, no further spatial downsample
+B x 512 x H/8 x W/8
+    |
+    v
+Swin bottleneck
+B x 512 x H/8 x W/8
+    |
+    v
+2x patchify: rearrange h,w 到 channel
+B x 2048 x H/16 x W/16
+    |
+    v
+norm + swish
+B x 2048 x H/16 x W/16
+    |
+    v
+conv_out: 2048 -> 2 * 32
+B x 64 x H/16 x W/16
+    |
+    v
+DiagonalGaussianDistribution
+z16: B x 32 x H/16 x W/16
+```
+
+原始 16x decoder 是上述过程的镜像：
+
+```text
+z16: B x 32 x H/16 x W/16
+    |
+    v
+conv_in: 32 -> 2048
+B x 2048 x H/16 x W/16
+    |
+    v
+2x unpatchify: channel 还原到 h,w
+B x 512 x H/8 x W/8
+    |
+    v
+Swin bottleneck + ResBlocks + Upsample stages
+B x 128 x H x W
+    |
+    v
+conv_out
+x_rec: B x 3 x H x W
+```
+
+### 32x DA-VAE 网络结构
+
+32x DA-VAE 不在 `conv_out` 之后的 `B x 64 x H/16 x W/16` moments 上继续压缩。真正新增的降采样点在 `conv_out` 之前：
+
+```text
+关键插入点:
+
+原始 16x encoder:
+2x patchify -> preconv16 -> conv_out -> z16 moments
+
+32x DA-VAE:
+2x patchify -> preconv16 -> DCDown2d(factor=2) -> z_detail moments
+                         ^
+                         |
+                 这里做进一步 2x 降采样
+```
+
+完整 32x encoder 结构如下：
+
+```text
+输入图像 x
+B x 3 x H x W
+    |
+    v
+复用原始 16x encoder 的 conv_in/down stages/Swin bottleneck
+B x 512 x H/8 x W/8
+    |
+    v
+2x patchify
+B x 2048 x H/16 x W/16
+    |
+    |  注意：这里跳过原始 16x 的 conv_out
+    v
+DCDown2d, factor=2
+  - 主分支: Conv2d + pixel_unshuffle(2)
+  - shortcut: pixel_unshuffle(2) + channel projection/group average
+B x 192 x H/32 x W/32
+    |
+    v
+DiagonalGaussianDistribution
+z_detail: B x 96 x H/32 x W/32
+```
+
+冻结 teacher/base path 同时产生同空间尺寸的 base latent：
+
+```text
+输入图像 x
+B x 3 x H x W
+    |
+    v
+resize 到半分辨率
+B x 3 x H/2 x W/2
+    |
+    v
+冻结 16x VAE encoder
+B x 64 x H/32 x W/32
+    |
+    v
+DiagonalGaussianDistribution.mode()
+z_base / z_teacher: B x 32 x H/32 x W/32
+```
+
+然后在 channel 维 concat，得到最终 32x latent：
+
+```text
+z_base:   B x 32 x H/32 x W/32
+z_detail: B x 96 x H/32 x W/32
+    |
+    v
+concat over channel
+z32:      B x 128 x H/32 x W/32
+```
+
+32x decoder 从 `z32` 还原到原始 16x decoder 的 `conv_in` 后接入点：
+
+```text
+z32: B x 128 x H/32 x W/32
+    |
+    v
+DCUp2d, factor=2
+  - 主分支: Conv2d + pixel_shuffle(2)
+  - shortcut: channel repeat/projection + pixel_shuffle(2)
+B x 2048 x H/16 x W/16
+    |
+    v
+2x unpatchify
+B x 512 x H/8 x W/8
+    |
+    v
+复用原始 16x decoder 的 Swin bottleneck + up stages + conv_out
+x_rec: B x 3 x H x W
+```
+
+### 16x 与 32x 的关键差异
+
+| 位置 | 原始 16x VAE | 32x DA-VAE |
+| --- | --- | --- |
+| encoder 复用部分 | 到 `preconv16` 后继续走原始 `conv_out` | 到 `preconv16` 后改走新增 `DCDown2d` |
+| 新增降采样位置 | 无 | `preconv16: B x 2048 x H/16 x W/16` 之后 |
+| 新增降采样方式 | 无 | `DCDown2d(factor=2)`，空间 `H/16 -> H/32`，通道聚合到 detail moments |
+| latent 构成 | `z16 = 32ch` | `z32 = concat(z_base 32ch, z_detail 96ch)` |
+| teacher/base | 无 | 冻结 16x VAE 编码半分辨率图像得到 `z_base` |
+| decoder 接入 | `z16 -> conv_in -> preconv16_hat` | `z32 -> DCUp2d -> preconv16_hat`，跳过原始 `conv_in` |
+| 语义对齐 | 无 | `z_detail -> z_detail_align` 对齐 `z_teacher` |
+
+因此，进一步降采样不是发生在最终 16x latent 上，而是发生在原始 16x encoder `conv_out` 之前的高维特征上。这样可以最大化保留进入 32x detail latent 的信息量，也和 DA-VAE 的 deep-compression 设计一致。
+
 ## 冻结 Teacher Path
 
 teacher 使用当前已有的 16x VAE encoder，并加载现有 f16c32 checkpoint。teacher 完全冻结，只用于产生语义对齐监督。
