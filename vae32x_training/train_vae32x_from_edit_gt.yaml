@@ -1,0 +1,93 @@
+args:
+  pretrained_model_name_or_path: ""
+  output_dir: "outputs/vae32x"
+  train_url: "outputs/vae32x_remote"
+  dataset_config_name: "/path/to/train_dataset.yaml"
+  val_dataset_config_name: "/path/to/val_dataset.yaml"
+  yml_path: "configs/vae32x/train_vae32x_from_edit_gt.yaml"
+
+  image_key: "edited_img"
+  train_batch_size: 16
+  num_train_epochs: 1
+  max_train_steps: 100000
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  discriminator_learning_rate: 1.0e-4
+  lr_scheduler: "constant"
+  lr_warmup_steps: 0
+  adam_beta1: 0.5
+  adam_beta2: 0.9
+  adam_weight_decay: 0.0
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  report_to: "tensorboard"
+  logging_dir: "logs"
+  dataloader_num_workers: 4
+  checkpointing_steps: 1000
+  checkpoints_total_limit: 5
+  visualization_steps: 500
+  val_visualization_steps: 2000
+  seed: 2333
+  allow_tf32: true
+  use_fsdp: false
+
+model:
+  target: models.vae32x_da.DAVAE32xFrom16x
+  params:
+    student_ckpt_path: "/path/to/current_f16c32_vae.pth"
+    teacher_ckpt_path: "/path/to/current_f16c32_vae.pth"
+    latent_channels_16x: 32
+    latent_channels_32x: 128
+    teacher_latent_channels: 32
+    preconv_channels: 2048
+    align_method: "mean"
+    pad_multiple: 32
+    freeze_student_encoder: true
+    freeze_student_decoder: true
+    student_config:
+      target: f16c32_vae_swin_dinov3_dec.autoencoder_2d_16x_5layer_ResBlockList_swin_2d.AutoencoderKL
+      params:
+        embed_dim: 32
+        ddconfig:
+          double_z: true
+          z_channels: 32
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 4, 4]
+          num_res_blocks: [2, 3, 2, 2]
+          attn_resolutions: []
+          dropout: 0.0
+    teacher_config:
+      target: f16c32_vae_swin_dinov3_dec.autoencoder_2d_16x_5layer_ResBlockList_swin_2d.AutoencoderKL
+      params:
+        embed_dim: 32
+        ddconfig:
+          double_z: true
+          z_channels: 32
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 4, 4]
+          num_res_blocks: [2, 3, 2, 2]
+          attn_resolutions: []
+          dropout: 0.0
+
+loss:
+  target: losses.contperceptual.LPIPSWithDiscriminator
+  params:
+    disc_start: 5001
+    kl_weight: 1.0e-6
+    pixelloss_weight: 1.0
+    disc_weight: 0.1
+    disc_factor: 1.0
+    perceptual_weight: 1.0
+    pp_style: true
+    adaptive_vf: true
+    vf_weight: 0.5
+    vf_proj_use_mse: true
+    distmat_margin: 0.0
+    cos_margin: 0.0
